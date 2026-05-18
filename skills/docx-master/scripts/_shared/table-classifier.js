@@ -1,0 +1,85 @@
+import { a as firstChildNS, d as textContent, h as NS, i as descendantsNS, p as wVal, s as getChildrenNS } from "./xml-utils.js";
+
+//#region lib/parse/table-classifier.ts
+function summarizeTable(tbl) {
+	const rows = getChildrenNS(tbl, NS.w, "tr");
+	const rowCount = rows.length;
+	let maxCols = 0;
+	const rowEffectiveCols = [];
+	for (const tr of rows) {
+		const tcs = getChildrenNS(tr, NS.w, "tc");
+		let cells = 0;
+		for (const tc of tcs) {
+			const tcPr = firstChildNS(tc, NS.w, "tcPr");
+			const gridSpan = tcPr ? firstChildNS(tcPr, NS.w, "gridSpan") : null;
+			const span = gridSpan ? parseInt(wVal(gridSpan) || "1", 10) : 1;
+			cells += span;
+		}
+		rowEffectiveCols.push(cells);
+		if (cells > maxCols) maxCols = cells;
+	}
+	const headers = [];
+	if (rows.length > 0) {
+		const first = rows[0];
+		for (const tc of getChildrenNS(first, NS.w, "tc")) {
+			const text = collectCellText(tc).trim();
+			headers.push(text);
+		}
+	}
+	const totalParas = descendantsNS(tbl, NS.w, "p").length;
+	let classification = "data";
+	if (rowEffectiveCols.every((c) => c === 1) && totalParas > 3) classification = "layout";
+	else if (rowCount > 1 && maxCols > 1) if (looksLikeHeaderRow(rows[0])) classification = "data";
+	else if (looksLikeForm(rows)) classification = "form";
+	else classification = "data";
+	else classification = "data";
+	return {
+		classification,
+		rows: rowCount,
+		cols: maxCols,
+		headers
+	};
+}
+function collectCellText(tc) {
+	return descendantsNS(tc, NS.w, "t").map((t) => textContent(t)).join("");
+}
+function looksLikeHeaderRow(tr) {
+	const tcs = getChildrenNS(tr, NS.w, "tc");
+	if (tcs.length === 0) return false;
+	let boldCells = 0;
+	let shortCells = 0;
+	let total = 0;
+	for (const tc of tcs) {
+		total++;
+		const text = collectCellText(tc).trim();
+		if (text.length > 0 && text.length <= 20) shortCells++;
+		const rPrs = descendantsNS(tc, NS.w, "rPr");
+		let hasBold = false;
+		for (const rPr of rPrs) {
+			const b = firstChildNS(rPr, NS.w, "b");
+			if (b && wVal(b) !== "0") {
+				hasBold = true;
+				break;
+			}
+		}
+		if (hasBold) boldCells++;
+	}
+	const ratio = (boldCells + shortCells) / (total * 2);
+	return boldCells >= Math.ceil(total / 2) || ratio > .6;
+}
+function looksLikeForm(rows) {
+	let formish = 0;
+	for (const tr of rows) {
+		const tcs = getChildrenNS(tr, NS.w, "tc");
+		if (tcs.length < 2) continue;
+		const leftText = collectCellText(tcs[0]).trim();
+		const rightText = collectCellText(tcs[tcs.length - 1]).trim();
+		if (leftText.length > 0 && leftText.length <= 12) {
+			if (rightText.length === 0 || rightText.length >= leftText.length) formish++;
+		}
+	}
+	return formish >= Math.ceil(rows.length / 2);
+}
+
+//#endregion
+export { summarizeTable as t };
