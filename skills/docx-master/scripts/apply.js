@@ -1005,6 +1005,32 @@ function lineSpacingToConfig(parsed) {
 }
 
 //#endregion
+//#region lib/xml/ind-attr.ts
+const w$18 = NS.w;
+const FIRST_LINE_GROUP = [
+	"firstLine",
+	"firstLineChars",
+	"hanging",
+	"hangingChars"
+];
+/** Write a parsed indent value onto a <w:ind> element.
+*  Emits even when `parsed.value === 0` — explicit zero overrides the
+*  style cascade. Callers gate on `parsed !== null` themselves
+*  (a `null` parse result means the source field was absent). */
+function setIndentAttr(ind, slot, parsed) {
+	const attr = parsed.kind === "char" ? `w:${slot}Chars` : `w:${slot}`;
+	ind.setAttributeNS(w$18, attr, String(parsed.value));
+}
+/** Remove all attrs in the firstLine / hanging mutually-exclusive group.
+*  In OOXML these four attrs are pairwise exclusive (same offset, different
+*  units; opposing directions). Field-merge into an existing <w:ind> must
+*  clear the group before writing the new value, otherwise stale attrs
+*  from a prior mutation produce ambiguous Word behavior. */
+function clearFirstLineHangingGroup(ind) {
+	for (const a of FIRST_LINE_GROUP) ind.removeAttributeNS(w$18, a);
+}
+
+//#endregion
 //#region lib/apply/style-mutation.ts
 /**
 * Insert a freshly-created `<w:pPr>` into a `<w:style>` at the schema-correct
@@ -1040,7 +1066,7 @@ function resolveStyleDef(def, paragraphs) {
 		const minIdx = indices[0] ?? 0;
 		const maxIdx = indices[indices.length - 1] ?? 0;
 		const closest = paragraphs.reduce((best, p) => Math.abs(p.index - def.fromParagraph) < Math.abs(best.index - def.fromParagraph) ? p : best, paragraphs[0]);
-		throw new Error(`style "${def.id}": fromParagraph #${def.fromParagraph} not found.\n  Document has ${paragraphs.length} indexed paragraphs (range: #${minIdx}–#${maxIdx}).\n  Closest valid: #${closest.index} ("${closest.text.slice(0, 40)}${closest.text.length > 40 ? "…" : ""}")\n  Note: paragraphs inside data tables and form tables are not indexed and cannot be referenced.`);
+		throw new Error(`style "${def.id}": fromParagraph #${def.fromParagraph} not found.\n  Document has ${paragraphs.length} indexed paragraphs (range: #${minIdx}–#${maxIdx}).\n  Closest valid: #${closest.index} ("${closest.text.slice(0, 40)}${closest.text.length > 40 ? "…" : ""}")\n  Note: paragraphs inside data tables are not indexed and cannot be referenced.`);
 	}
 	const extracted = paragraphToStyleEntry(para);
 	const { id: _id, name: _name, fromParagraph: _fp, basedOn: _bo, overrides: _ov, ...topLevel } = def;
@@ -1148,34 +1174,33 @@ function resolveStyleRef(stylesDoc, val, selfId) {
 	}
 	return null;
 }
-/** pPr / rPr children that this function clears before re-writing from `def`.
-* Anything else found in an existing style's pPr/rPr is preserved untouched.
-* The pPr list is critical: numPr (auto-numbering binding), keepNext, pBdr,
-* shd, adjustRightInd, etc. are all preserved when overriding an existing
-* style.
+/** Return (or create) a child element with the given local name under
+* `parent`. When creating, the new element is NOT inserted — caller must
+* place it via `insertChildInOrder` or equivalent so schema order is
+* respected. When the element already exists it is returned as-is for
+* attribute-level mutation. */
+function getOrCreateNS(parent, doc, ns, localName) {
+	const existing = firstChildNS(parent, ns, localName);
+	if (existing) return existing;
+	return doc.createElementNS(ns, `w:${localName}`);
+}
+/**
+* Upsert an OOXML toggle element (bold, italic, etc.) in `parent`.
 *
-* Scope: only the children writeable from `StyleConfigEntry`. Narrower than
-* fragment-emit's RPR_MANAGED_LOCAL_NAMES (run-level rPr from `RunFormat`,
-* which has u / strike). The two sets must NOT be unified — expanding this
-* one without adding the corresponding write paths would silently drop
-* existing style attrs (e.g. <w:u>) that the engine has no way to put back. */
-const PPR_MANAGED_CHILDREN = new Set([
-	"spacing",
-	"ind",
-	"jc",
-	"outlineLvl"
-]);
-const RPR_MANAGED_CHILDREN = new Set([
-	"rFonts",
-	"sz",
-	"szCs",
-	"b",
-	"bCs",
-	"i",
-	"iCs",
-	"color",
-	"vertAlign"
-]);
+* - `on === true`:  ensure element exists with no `w:val` attribute (presence = on).
+* - `on === false`: ensure element exists with `w:val="0"` (explicit off — overrides
+*   any `basedOn` ancestor that declares the toggle; removing the element would mean
+*   "inherit", not "force off").
+*/
+function upsertToggle(parent, doc, ns, localName, on, order) {
+	let el = firstChildNS(parent, ns, localName);
+	if (!el) {
+		el = doc.createElementNS(ns, `w:${localName}`);
+		insertChildInOrder(parent, el, order);
+	}
+	if (on) el.removeAttributeNS(ns, "val");
+	else el.setAttributeNS(ns, "w:val", "0");
+}
 function upsertStyle(stylesDoc, def) {
 	const w = NS.w;
 	const root = stylesDoc.documentElement;
@@ -1193,11 +1218,14 @@ function upsertStyle(stylesDoc, def) {
 		result = "created";
 	}
 	let nameEl = firstChildNS(target, w, "name");
-	if (nameEl) nameEl.setAttributeNS(w, "w:val", def.name);
-	else {
-		nameEl = stylesDoc.createElementNS(w, "w:name");
-		nameEl.setAttributeNS(w, "w:val", def.name);
-		target.insertBefore(nameEl, target.firstChild);
+	if (result === "updated" && def.name === void 0) {} else {
+		const nameVal = def.name ?? def.id;
+		if (nameEl) nameEl.setAttributeNS(w, "w:val", nameVal);
+		else {
+			nameEl = stylesDoc.createElementNS(w, "w:name");
+			nameEl.setAttributeNS(w, "w:val", nameVal);
+			target.insertBefore(nameEl, target.firstChild);
+		}
 	}
 	if (def.basedOn) {
 		const resolved = resolveStyleRef(stylesDoc, def.basedOn, def.id);
@@ -1206,108 +1234,97 @@ function upsertStyle(stylesDoc, def) {
 		else {
 			bo = stylesDoc.createElementNS(w, "w:basedOn");
 			bo.setAttributeNS(w, "w:val", resolved);
-			const afterName = nameEl.nextSibling;
+			const afterName = firstChildNS(target, w, "name")?.nextSibling ?? null;
 			if (afterName) target.insertBefore(bo, afterName);
 			else target.appendChild(bo);
 		}
 		else if (bo) target.removeChild(bo);
 	}
+	const hasPPrChange = def.outlineLevel !== void 0 || def.alignment !== void 0 || def.spaceBefore !== void 0 || def.spaceAfter !== void 0 || def.lineSpacing !== void 0 || def.firstLineIndent != null || def.hangingIndent != null;
 	let pPr = firstChildNS(target, w, "pPr");
-	if (pPr) {
-		for (const c of Array.from(getChildren(pPr))) if (c.namespaceURI === w && PPR_MANAGED_CHILDREN.has(c.localName)) pPr.removeChild(c);
-	}
-	const pPrAdditions = [];
-	if (def.outlineLevel !== void 0) {
-		const ol = stylesDoc.createElementNS(w, "w:outlineLvl");
-		ol.setAttributeNS(w, "w:val", String(def.outlineLevel));
-		pPrAdditions.push(ol);
-	}
-	if (def.alignment) {
-		const jc = stylesDoc.createElementNS(w, "w:jc");
-		jc.setAttributeNS(w, "w:val", def.alignment);
-		pPrAdditions.push(jc);
-	}
-	if (def.spaceBefore !== void 0 || def.spaceAfter !== void 0 || def.lineSpacing !== void 0) {
-		const spacing = stylesDoc.createElementNS(w, "w:spacing");
-		if (def.spaceBefore !== void 0) spacing.setAttributeNS(w, "w:before", String(toTwips(def.spaceBefore, "spaceBefore")));
-		if (def.spaceAfter !== void 0) spacing.setAttributeNS(w, "w:after", String(toTwips(def.spaceAfter, "spaceAfter")));
-		if (def.lineSpacing !== void 0) {
-			const ls = parseLineSpacing(def.lineSpacing, "lineSpacing");
-			spacing.setAttributeNS(w, "w:line", String(ls.value));
-			spacing.setAttributeNS(w, "w:lineRule", ls.mode);
-		}
-		pPrAdditions.push(spacing);
-	}
-	if (def.firstLineIndent != null || def.hangingIndent != null) {
-		const ind = stylesDoc.createElementNS(w, "w:ind");
-		if (def.firstLineIndent != null && def.firstLineIndent !== 0) {
-			const r = parseIndent(def.firstLineIndent);
-			if (r) if (r.kind === "char") ind.setAttributeNS(w, "w:firstLineChars", String(r.value));
-			else ind.setAttributeNS(w, "w:firstLine", String(r.value));
-		}
-		if (def.hangingIndent != null && def.hangingIndent !== 0) {
-			const r = parseIndent(def.hangingIndent);
-			if (r) if (r.kind === "char") ind.setAttributeNS(w, "w:hangingChars", String(r.value));
-			else ind.setAttributeNS(w, "w:hanging", String(r.value));
-		}
-		pPrAdditions.push(ind);
-	}
-	if (pPrAdditions.length > 0) {
+	if (hasPPrChange) {
 		if (!pPr) {
 			pPr = stylesDoc.createElementNS(w, "w:pPr");
 			insertPPrIntoStyle(target, pPr);
 		}
-		for (const c of pPrAdditions) insertChildInOrder(pPr, c, PPR_CHILD_ORDER);
-	}
-	let rPr = firstChildNS(target, w, "rPr");
-	if (rPr) {
-		for (const c of Array.from(getChildren(rPr))) if (c.namespaceURI === w && RPR_MANAGED_CHILDREN.has(c.localName)) rPr.removeChild(c);
-	}
-	const rPrAdditions = [];
-	if (def.fontLatin || def.fontCJK) {
-		const rFonts = stylesDoc.createElementNS(w, "w:rFonts");
-		const ascii = def.fontLatin ?? def.fontCJK ?? "";
-		const ea = def.fontCJK ?? def.fontLatin ?? "";
-		if (ascii) {
-			rFonts.setAttributeNS(w, "w:ascii", ascii);
-			rFonts.setAttributeNS(w, "w:hAnsi", ascii);
+		if (def.outlineLevel !== void 0) {
+			const ol = getOrCreateNS(pPr, stylesDoc, w, "outlineLvl");
+			ol.setAttributeNS(w, "w:val", String(def.outlineLevel));
+			if (!ol.parentNode) insertChildInOrder(pPr, ol, PPR_CHILD_ORDER);
 		}
-		if (ea) rFonts.setAttributeNS(w, "w:eastAsia", ea);
-		rPrAdditions.push(rFonts);
+		if (def.alignment !== void 0) {
+			const jc = getOrCreateNS(pPr, stylesDoc, w, "jc");
+			jc.setAttributeNS(w, "w:val", def.alignment);
+			if (!jc.parentNode) insertChildInOrder(pPr, jc, PPR_CHILD_ORDER);
+		}
+		if (def.spaceBefore !== void 0 || def.spaceAfter !== void 0 || def.lineSpacing !== void 0) {
+			const spacing = getOrCreateNS(pPr, stylesDoc, w, "spacing");
+			if (def.spaceBefore !== void 0) spacing.setAttributeNS(w, "w:before", String(toTwips(def.spaceBefore, "spaceBefore")));
+			if (def.spaceAfter !== void 0) spacing.setAttributeNS(w, "w:after", String(toTwips(def.spaceAfter, "spaceAfter")));
+			if (def.lineSpacing !== void 0) {
+				const ls = parseLineSpacing(def.lineSpacing, "lineSpacing");
+				spacing.setAttributeNS(w, "w:line", String(ls.value));
+				spacing.setAttributeNS(w, "w:lineRule", ls.mode);
+			}
+			if (!spacing.parentNode) insertChildInOrder(pPr, spacing, PPR_CHILD_ORDER);
+		}
+		if (def.firstLineIndent != null || def.hangingIndent != null) {
+			const ind = getOrCreateNS(pPr, stylesDoc, w, "ind");
+			clearFirstLineHangingGroup(ind);
+			if (def.firstLineIndent != null) {
+				const r = parseIndent(def.firstLineIndent);
+				if (r) setIndentAttr(ind, "firstLine", r);
+			}
+			if (def.hangingIndent != null) {
+				const r = parseIndent(def.hangingIndent);
+				if (r) setIndentAttr(ind, "hanging", r);
+			}
+			if (!ind.parentNode) insertChildInOrder(pPr, ind, PPR_CHILD_ORDER);
+		}
 	}
-	if (def.size !== void 0) {
-		const halfPt = toHalfPt(def.size, "size");
-		const sz = stylesDoc.createElementNS(w, "w:sz");
-		sz.setAttributeNS(w, "w:val", String(halfPt));
-		rPrAdditions.push(sz);
-		const szCs = stylesDoc.createElementNS(w, "w:szCs");
-		szCs.setAttributeNS(w, "w:val", String(halfPt));
-		rPrAdditions.push(szCs);
-	}
-	if (def.bold) {
-		rPrAdditions.push(stylesDoc.createElementNS(w, "w:b"));
-		rPrAdditions.push(stylesDoc.createElementNS(w, "w:bCs"));
-	}
-	if (def.italic) {
-		rPrAdditions.push(stylesDoc.createElementNS(w, "w:i"));
-		rPrAdditions.push(stylesDoc.createElementNS(w, "w:iCs"));
-	}
-	if (def.color) {
-		const color = stylesDoc.createElementNS(w, "w:color");
-		color.setAttributeNS(w, "w:val", def.color);
-		rPrAdditions.push(color);
-	}
-	if (def.vertAlign) {
-		const va = stylesDoc.createElementNS(w, "w:vertAlign");
-		va.setAttributeNS(w, "w:val", def.vertAlign);
-		rPrAdditions.push(va);
-	}
-	if (rPrAdditions.length > 0) {
+	const hasRPrChange = def.fontLatin !== void 0 || def.fontCJK !== void 0 || def.size !== void 0 || def.bold !== void 0 || def.italic !== void 0 || def.color !== void 0 || def.vertAlign !== void 0;
+	let rPr = firstChildNS(target, w, "rPr");
+	if (hasRPrChange) {
 		if (!rPr) {
 			rPr = stylesDoc.createElementNS(w, "w:rPr");
 			target.appendChild(rPr);
 		}
-		for (const c of rPrAdditions) insertChildInOrder(rPr, c, RPR_CHILD_ORDER);
+		if (def.fontLatin !== void 0 || def.fontCJK !== void 0) {
+			const rFonts = getOrCreateNS(rPr, stylesDoc, w, "rFonts");
+			if (def.fontLatin !== void 0) {
+				rFonts.setAttributeNS(w, "w:ascii", def.fontLatin);
+				rFonts.setAttributeNS(w, "w:hAnsi", def.fontLatin);
+			}
+			if (def.fontCJK !== void 0) rFonts.setAttributeNS(w, "w:eastAsia", def.fontCJK);
+			if (!rFonts.parentNode) insertChildInOrder(rPr, rFonts, RPR_CHILD_ORDER);
+		}
+		if (def.size !== void 0) {
+			const halfPt = toHalfPt(def.size, "size");
+			const sz = getOrCreateNS(rPr, stylesDoc, w, "sz");
+			sz.setAttributeNS(w, "w:val", String(halfPt));
+			if (!sz.parentNode) insertChildInOrder(rPr, sz, RPR_CHILD_ORDER);
+			const szCs = getOrCreateNS(rPr, stylesDoc, w, "szCs");
+			szCs.setAttributeNS(w, "w:val", String(halfPt));
+			if (!szCs.parentNode) insertChildInOrder(rPr, szCs, RPR_CHILD_ORDER);
+		}
+		if (def.bold !== void 0) {
+			upsertToggle(rPr, stylesDoc, w, "b", def.bold, RPR_CHILD_ORDER);
+			upsertToggle(rPr, stylesDoc, w, "bCs", def.bold, RPR_CHILD_ORDER);
+		}
+		if (def.italic !== void 0) {
+			upsertToggle(rPr, stylesDoc, w, "i", def.italic, RPR_CHILD_ORDER);
+			upsertToggle(rPr, stylesDoc, w, "iCs", def.italic, RPR_CHILD_ORDER);
+		}
+		if (def.color !== void 0) {
+			const color = getOrCreateNS(rPr, stylesDoc, w, "color");
+			color.setAttributeNS(w, "w:val", def.color);
+			if (!color.parentNode) insertChildInOrder(rPr, color, RPR_CHILD_ORDER);
+		}
+		if (def.vertAlign !== void 0) {
+			const va = getOrCreateNS(rPr, stylesDoc, w, "vertAlign");
+			va.setAttributeNS(w, "w:val", def.vertAlign);
+			if (!va.parentNode) insertChildInOrder(rPr, va, RPR_CHILD_ORDER);
+		}
 	}
 	return result;
 }
@@ -1486,13 +1503,20 @@ function resolveSuff(lvlText, explicit) {
 		effectiveLvlText: lvlText.replace(/ +$/, "")
 	};
 }
-function injectNumbering(numberingDoc, config) {
+function injectNumbering(numberingDoc, config, opts = {}) {
 	const w = NS.w;
 	const root = numberingDoc.documentElement;
 	const existingAbsIds = getChildrenNS(root, w, "abstractNum").map((e) => parseInt(wAttr(e, "abstractNumId") || "0", 10));
 	const existingNumIds = getChildrenNS(root, w, "num").map((e) => parseInt(wAttr(e, "numId") || "0", 10));
 	const nextAbs = (existingAbsIds.length ? Math.max(...existingAbsIds) : -1) + 1;
-	const nextNum = (existingNumIds.length ? Math.max(...existingNumIds) : 0) + 1;
+	let nextNum;
+	if (opts.requestedNumId !== void 0) nextNum = opts.requestedNumId;
+	else {
+		const claimed = opts.claimedNumIds ?? /* @__PURE__ */ new Set();
+		let candidate = (existingNumIds.length ? Math.max(...existingNumIds) : 0) + 1;
+		while (claimed.has(candidate)) candidate++;
+		nextNum = candidate;
+	}
 	const abs = numberingDoc.createElementNS(w, "w:abstractNum");
 	abs.setAttributeNS(w, "w:abstractNumId", String(nextAbs));
 	const multiLevelType = numberingDoc.createElementNS(w, "w:multiLevelType");
@@ -1658,8 +1682,8 @@ function attachNumberingToStyle(stylesDoc, styleId, numId, level) {
 //#endregion
 //#region lib/apply/list-restart.ts
 /**
-* Per-instance restart pass for single-level numbering schemes that opt in
-* via `restart: "perInstance"`.
+* List-restart pass for single-level numbering schemes that opt in via a
+* scheme-level `restart` value.
 *
 * Word's `<w:num>` element IS the counter. All paragraphs sharing a numId
 * share one counter — so a style-level binding makes the counter run
@@ -1667,33 +1691,69 @@ function attachNumberingToStyle(stylesDoc, styleId, numId, level) {
 * caption / reference / global-counter shapes and is the default
 * (`restart: "continuous"`).
 *
-* For procedural list shapes (ListNumber / ListBullet 1./2./3. lists), a
-* shared counter is wrong: a list in Chapter 1 would continue numbering in
-* Chapter 2. Multi-level heading schemes solve this with `<w:lvlRestart>`,
-* but single-level schemes have no analogous mechanism. The workaround Word
-* itself uses: each list instance gets its own `<w:num>` pointing to the
-* same abstractNumId but carrying
-* `<w:lvlOverride><w:startOverride val="1"/></w:lvlOverride>`. Each
-* instance's paragraphs get paragraph-level `<w:numPr>` overriding the
-* style-level binding.
+* The engine supports three opt-in restart modes:
 *
-* "Instance" = contiguous run of paragraphs with the target styleId in
-* document tree order. Non-target paragraphs break the run. Matches user
-* intuition: a list interrupted by a heading or body paragraph starts fresh.
+*   "perInstance"        — restart at each contiguous run of paragraphs
+*                          bound to the scheme's styleId. A non-target
+*                          paragraph breaks the run and triggers a restart.
+*                          Classic use: 1./2./3. lists in Chapter 1 that
+*                          should start fresh in Chapter 2.
 *
-* Only single-level schemes with `restart === "perInstance"` are forked;
+*   "byHeading"          — restart whenever a heading-styled paragraph
+*                          (any style with <w:outlineLvl>, or a paragraph
+*                          with direct <w:outlineLvl> in its own pPr) is
+*                          encountered. Each heading increments a per-target
+*                          epoch counter; when a list paragraph's last-seen
+*                          epoch differs from the current epoch, a new fork
+*                          is started. Use for "each chapter gets its own
+*                          1, 2, 3, …" without caring which heading level
+*                          triggered it.
+*
+*   { atStyleChange: S } — restart whenever a paragraph bound to styleId S
+*                          precedes the current list paragraph. Useful when
+*                          chapter boundaries are marked by a custom style
+*                          that doesn't carry outlineLvl (e.g. "ProposalH2").
+*
+* All three modes share the same OOXML mechanism: fork a fresh `<w:num>`
+* pointing to the same abstractNumId but carrying
+* `<w:lvlOverride><w:startOverride val="1"/></w:lvlOverride>`, and write
+* paragraph-level `<w:numPr>` on each affected paragraph so it overrides
+* the style-level binding.
+*
+* Only single-level schemes with a non-"continuous" restart are forked;
 * multi-level schemes and continuous single-level schemes are skipped.
 */
-function applyListRestartPass(documentDoc, numberingDoc, installedSchemes) {
+/**
+* Build the set of styleIds that declare <w:outlineLvl> in their <w:pPr>
+* in styles.xml. Used by applyListRestartPass for byHeading mode to detect
+* heading paragraphs via the style cascade, not just via direct pPr overrides.
+*/
+function buildHeadingStyleIdSet(stylesDoc) {
+	const w = NS.w;
+	const result = /* @__PURE__ */ new Set();
+	const root = stylesDoc.documentElement;
+	if (!root) return result;
+	for (const styleEl of getChildrenNS(root, w, "style")) {
+		const id = wAttr(styleEl, "styleId");
+		if (!id) continue;
+		const pPr = firstChildNS(styleEl, w, "pPr");
+		if (!pPr) continue;
+		if (firstChildNS(pPr, w, "outlineLvl")) result.add(id);
+	}
+	return result;
+}
+function applyListRestartPass(documentDoc, numberingDoc, installedSchemes, headingStyleIds) {
 	const targets = [];
 	for (const scheme of installedSchemes) {
 		if (scheme.levels.length !== 1) continue;
 		const lvl = scheme.levels[0];
-		if (lvl.restart !== "perInstance") continue;
+		if (lvl.restart === "continuous" || !lvl.restart) continue;
 		targets.push({
 			styleId: lvl.styleId,
 			abstractNumId: scheme.abstractNumId,
-			level: lvl.level
+			level: lvl.level,
+			mode: lvl.restart,
+			baseNumId: scheme.numId
 		});
 	}
 	if (targets.length === 0) return;
@@ -1712,23 +1772,85 @@ function applyListRestartPass(documentDoc, numberingDoc, installedSchemes) {
 		}
 	};
 	const w = NS.w;
+	const headingEpoch = { value: 0 };
+	const lastSeenEpochByStyle = /* @__PURE__ */ new Map();
+	const atStylePending = /* @__PURE__ */ new Map();
+	for (const t of targets) if (t.mode === "byHeading") lastSeenEpochByStyle.set(t.styleId, 0);
+	else if (typeof t.mode === "object") atStylePending.set(t.styleId, false);
 	const body = firstChildNS(documentDoc.documentElement, w, "body");
 	if (!body) return;
 	for (const child of walkBodyParagraphs(body)) {
 		const pPr = firstChildNS(child, w, "pPr");
-		const pStyle = pPr ? firstChildNS(pPr, w, "pStyle") : null;
-		const styleId = pStyle ? wAttr(pStyle, "val") : "";
-		const target = styleId ? styleIdToTarget.get(styleId) : void 0;
+		const pStyleEl = pPr ? firstChildNS(pPr, w, "pStyle") : null;
+		const paragraphStyleId = pStyleEl ? wAttr(pStyleEl, "val") : "";
+		let isHeading = false;
+		if (paragraphStyleId && headingStyleIds?.has(paragraphStyleId)) isHeading = true;
+		else if (pPr && firstChildNS(pPr, w, "outlineLvl")) isHeading = true;
+		const target = paragraphStyleId ? styleIdToTarget.get(paragraphStyleId) : void 0;
 		if (target) {
-			currentRunByStyle.get(target.styleId).push(child);
-			for (const t of targets) if (t.styleId !== target.styleId) flush(t.styleId);
-		} else for (const t of targets) flush(t.styleId);
+			const { mode } = target;
+			if (mode === "perInstance") {
+				currentRunByStyle.get(target.styleId).push(child);
+				for (const t of targets) if (t.styleId !== target.styleId && t.mode === "perInstance") flush(t.styleId);
+			} else if (mode === "byHeading") {
+				if (lastSeenEpochByStyle.get(target.styleId) !== headingEpoch.value) {
+					flush(target.styleId);
+					lastSeenEpochByStyle.set(target.styleId, headingEpoch.value);
+				}
+				const existingNumPr = pPr ? firstChildNS(pPr, w, "numPr") : null;
+				if (existingNumPr) {
+					const numIdEl = firstChildNS(existingNumPr, w, "numId");
+					const existingNumId = numIdEl ? wAttr(numIdEl, "val") : null;
+					if (existingNumId !== null && existingNumId !== target.baseNumId) {
+						flush(target.styleId);
+						continue;
+					}
+				}
+				currentRunByStyle.get(target.styleId).push(child);
+			} else {
+				if (atStylePending.get(target.styleId)) {
+					flush(target.styleId);
+					atStylePending.set(target.styleId, false);
+				}
+				currentRunByStyle.get(target.styleId).push(child);
+			}
+		} else {
+			if (isHeading) headingEpoch.value++;
+			for (const t of targets) if (t.mode === "perInstance") flush(t.styleId);
+			else if (typeof t.mode === "object") {
+				if (paragraphStyleId === t.mode.atStyleChange) atStylePending.set(t.styleId, true);
+			}
+		}
 	}
 	for (const t of targets) flush(t.styleId);
 	for (const t of targets) for (const run of runs.get(t.styleId)) {
 		const newNumId = forkNumWithStartOverride(numberingDoc, t.abstractNumId, t.level);
 		for (const p of run) setParagraphNumPr(p, newNumId, t.level);
 	}
+}
+/**
+* Fork a fresh `<w:num>` for a paragraph-level explicit restart
+* (`numbering.restart: true` in a ParagraphBlock).
+*
+* Looks up the abstractNumId from the paragraph's current numId in
+* numberingDoc, forks it with `<w:startOverride val="1"/>`, and rewrites the
+* paragraph's `<w:numPr>` to use the new numId. Restart applies only to this
+* paragraph; subsequent paragraphs continue with their own declared numbering.
+*
+* Throws when numId doesn't resolve in numberingDoc — schema-valid input but
+* doctree-inconsistent (caller passed a numId not installed in the doc).
+*/
+function applyParagraphLevelRestart(pEl, numberingDoc, numId, level) {
+	const w = NS.w;
+	const root = numberingDoc.documentElement;
+	let abstractNumId = null;
+	for (const num of getChildrenNS(root, w, "num")) if (wAttr(num, "numId") === numId) {
+		const absRef = firstChildNS(num, w, "abstractNumId");
+		abstractNumId = absRef ? wAttr(absRef, "val") : null;
+		break;
+	}
+	if (!abstractNumId) throw new Error(`numbering.restart: numId "${numId}" not found in numbering.xml. Fix: use a numId that exists in the document's numbering.xml, or install a numbering scheme via config.numbering first.`);
+	setParagraphNumPr(pEl, forkNumWithStartOverride(numberingDoc, abstractNumId, level), level);
 }
 
 //#endregion
@@ -1867,6 +1989,126 @@ function renderVsDirect(r, lines) {
 		if (f.fresh > 0) lines.push(`      new:       ${f.field}=${shortVal(f.declared)} (${f.fresh}/${n} no direct equivalent)`);
 	}
 }
+/**
+* Compute a compact pre→post paragraph index drift map from a set of dry-run
+* edit previews.  Returns an empty array when there is no body-level drift
+* (all ops are format / set-run / cell-container ops that don't shift body
+* indices).
+*
+* @param entries   Per-op previews from `previewEditOps`.
+* @param totalPre  Last paragraph index (inclusive) in the pre-edit document.
+*                  When > 0 the map shows trailing unchanged bands; when ≤ 0
+*                  the map stops after the last affected region.
+*/
+function computeDriftBands(entries, totalPre) {
+	const bodyOps = entries.filter((e) => {
+		if (e.container !== "body") return false;
+		return e.willReplaceOrDeleteIndices.length > 0 || e.willInsertCount > 0;
+	});
+	if (bodyOps.length === 0) return [];
+	const removedKind = /* @__PURE__ */ new Map();
+	const offsetEvents = [];
+	for (const e of bodyOps) {
+		const removed = e.willReplaceOrDeleteIndices;
+		if (removed.length === 0) {
+			const anchor = e.targetParaIndices[0] ?? -1;
+			if (anchor < 0) continue;
+			const delta = e.willInsertCount;
+			if (delta === 0) continue;
+			if (e.op === "insert-before") offsetEvents.push({
+				afterIndex: anchor - 1,
+				delta
+			});
+			else offsetEvents.push({
+				afterIndex: anchor,
+				delta
+			});
+			continue;
+		}
+		const sortedRemoved = [...removed].sort((a, b) => a - b);
+		const isMerge = e.op === "merge";
+		const kind = isMerge ? "merged" : "deleted";
+		for (const idx of sortedRemoved) {
+			if (isMerge && idx === e.survivorIndex) continue;
+			removedKind.set(idx, kind);
+		}
+		const netDelta = (isMerge ? 1 : e.willInsertCount) - sortedRemoved.length;
+		if (netDelta !== 0) offsetEvents.push({
+			afterIndex: sortedRemoved[sortedRemoved.length - 1],
+			delta: netDelta
+		});
+	}
+	if (removedKind.size === 0 && offsetEvents.length === 0) return [];
+	offsetEvents.sort((a, b) => a.afterIndex - b.afterIndex);
+	const maxPreFromOps = removedKind.size > 0 ? Math.max(...removedKind.keys(), ...offsetEvents.map((ev) => ev.afterIndex)) : Math.max(...offsetEvents.map((ev) => ev.afterIndex));
+	const maxPre = totalPre > 0 ? totalPre : maxPreFromOps + 20;
+	const bands = [];
+	let runningOffset = 0;
+	let eventIdx = 0;
+	let runStart = 0;
+	let runKind = "unchanged";
+	let runPostStart = 0;
+	function flushRun(preEnd) {
+		if (runStart > preEnd) return;
+		if (runKind === "unchanged") bands.push({
+			kind: "unchanged",
+			preStart: runStart,
+			preEnd
+		});
+		else if (runKind === "deleted") bands.push({
+			kind: "deleted",
+			preStart: runStart,
+			preEnd
+		});
+		else if (runKind === "merged") bands.push({
+			kind: "merged",
+			preStart: runStart,
+			preEnd
+		});
+		else bands.push({
+			kind: "shifted",
+			preStart: runStart,
+			preEnd,
+			postStart: runPostStart
+		});
+	}
+	for (let pre = 0; pre <= maxPre; pre++) {
+		while (eventIdx < offsetEvents.length && offsetEvents[eventIdx].afterIndex < pre) {
+			runningOffset += offsetEvents[eventIdx].delta;
+			eventIdx++;
+		}
+		const thisKind = removedKind.get(pre) ?? (runningOffset !== 0 ? "shifted" : "unchanged");
+		const thisPostStart = pre + runningOffset;
+		if (thisKind !== runKind || thisKind === "shifted" && thisPostStart !== runPostStart + (pre - runStart)) {
+			flushRun(pre - 1);
+			runStart = pre;
+			runKind = thisKind;
+			runPostStart = thisPostStart;
+		}
+	}
+	flushRun(maxPre);
+	return bands;
+}
+/** Render drift bands as report lines. Returns empty array when there's nothing
+*  to show (no-drift case). */
+function renderDriftLines(bands) {
+	if (bands.filter((b) => b.kind !== "unchanged").length === 0) return [];
+	const lines = [];
+	lines.push("=== Paragraph index drift (pre-edit → post-edit) ===");
+	function fmtRange(start, end) {
+		const w3 = (n) => String(n).padStart(3, "0");
+		return start === end ? `#${w3(start)}` : `#${w3(start)}..#${w3(end)}`;
+	}
+	for (const b of bands) if (b.kind === "unchanged") lines.push(`  pre ${fmtRange(b.preStart, b.preEnd)}  → unchanged`);
+	else if (b.kind === "deleted") lines.push(`  pre ${fmtRange(b.preStart, b.preEnd)}  → DELETED`);
+	else if (b.kind === "merged") lines.push(`  pre ${fmtRange(b.preStart, b.preEnd)}  → MERGED`);
+	else {
+		const postEnd = b.postStart + (b.preEnd - b.preStart);
+		lines.push(`  pre ${fmtRange(b.preStart, b.preEnd)}  → post ${fmtRange(b.postStart, postEnd)}`);
+	}
+	lines.push("");
+	return lines;
+}
 function printReport(args) {
 	const lines = [];
 	lines.push(args.dryRun ? "=== Change Report (DRY RUN — no file written) ===" : "=== Change Report ===");
@@ -1949,6 +2191,15 @@ function printReport(args) {
 		if (args.excludeSamples.length > cap) lines.push(`  … (${args.excludeSamples.length - cap} more)`);
 		lines.push("  → Verify these indices still match — if document order shifted,");
 		lines.push("    exclude entries silently aim at the wrong paragraphs.");
+		lines.push("");
+	}
+	if (args.numberingAllocation.length > 0) {
+		lines.push("=== Numbering schemes ===");
+		for (const entry of args.numberingAllocation) {
+			const label = `scheme[${entry.schemeIndex}]`;
+			const tag = entry.explicit ? "(explicit)" : "(allocated)";
+			lines.push(`  ${label.padEnd(12)} → numId=${entry.numId} ${tag}`);
+		}
 		lines.push("");
 	}
 	if (args.numberingBindings.length > 0) {
@@ -2069,6 +2320,10 @@ function printReport(args) {
 		lines.push("  Note: implicit-keep counts above already exclude paragraphs the edits[] pass will replace/delete.");
 		lines.push("");
 	}
+	if (args.dryRun && args.editsPreview.length > 0) {
+		const bands = computeDriftBands(args.editsPreview, args.totalParagraphs ?? -1);
+		for (const line of renderDriftLines(bands)) lines.push(line);
+	}
 	if (args.captionsPreview) {
 		const cp = args.captionsPreview;
 		lines.push("=== Captions / Cross-Refs Preview (dry-run) ===");
@@ -2149,21 +2404,21 @@ function pageSetupDiff(before, after) {
 * Returns `undefined` for unknown styleIds — caller decides whether
 * to throw or fall back.
 */
-const w$16 = NS.w;
+const w$17 = NS.w;
 function buildStyleResolver(stylesDoc) {
 	if (!stylesDoc) return () => void 0;
 	const root = stylesDoc.documentElement;
 	if (!root) return () => void 0;
 	const map = /* @__PURE__ */ new Map();
-	for (const styleEl of getChildrenNS(root, w$16, "style")) {
+	for (const styleEl of getChildrenNS(root, w$17, "style")) {
 		const id = wAttr(styleEl, "styleId");
 		if (!id) continue;
-		const nameEl = firstChildNS(styleEl, w$16, "name");
+		const nameEl = firstChildNS(styleEl, w$17, "name");
 		const name = nameEl ? wAttr(nameEl, "val") ?? id : id;
 		let outlineLevel;
-		const pPr = firstChildNS(styleEl, w$16, "pPr");
+		const pPr = firstChildNS(styleEl, w$17, "pPr");
 		if (pPr) {
-			const lvlEl = firstChildNS(pPr, w$16, "outlineLvl");
+			const lvlEl = firstChildNS(pPr, w$17, "outlineLvl");
 			if (lvlEl) {
 				const v = wAttr(lvlEl, "val");
 				const n = v !== null && v !== void 0 ? parseInt(v, 10) : NaN;
@@ -2207,32 +2462,32 @@ function buildStyleResolver(stylesDoc) {
 * run we wrote; MERGEFORMAT tells Word to preserve that rPr across
 * subsequent updates. Either alone is insufficient.
 */
-const w$15 = NS.w;
+const w$16 = NS.w;
 const XML_NS = "http://www.w3.org/XML/1998/namespace";
 /** Emit a complex field's 5-run sequence. Returns the runs plus direct
 * references to the result run and its text element for callers that
 * need to backfill the placeholder later (e.g. REF after counter sim). */
 function emitComplexField(ownerDoc, spec) {
-	const begin = ownerDoc.createElementNS(w$15, "w:r");
-	const beginFld = ownerDoc.createElementNS(w$15, "w:fldChar");
-	beginFld.setAttributeNS(w$15, "w:fldCharType", "begin");
+	const begin = ownerDoc.createElementNS(w$16, "w:r");
+	const beginFld = ownerDoc.createElementNS(w$16, "w:fldChar");
+	beginFld.setAttributeNS(w$16, "w:fldCharType", "begin");
 	begin.appendChild(beginFld);
-	const instr = ownerDoc.createElementNS(w$15, "w:r");
-	const instrText = ownerDoc.createElementNS(w$15, "w:instrText");
+	const instr = ownerDoc.createElementNS(w$16, "w:r");
+	const instrText = ownerDoc.createElementNS(w$16, "w:instrText");
 	instrText.setAttributeNS(XML_NS, "xml:space", "preserve");
 	instr.appendChild(instrText);
-	const separate = ownerDoc.createElementNS(w$15, "w:r");
-	const sepFld = ownerDoc.createElementNS(w$15, "w:fldChar");
-	sepFld.setAttributeNS(w$15, "w:fldCharType", "separate");
+	const separate = ownerDoc.createElementNS(w$16, "w:r");
+	const sepFld = ownerDoc.createElementNS(w$16, "w:fldChar");
+	sepFld.setAttributeNS(w$16, "w:fldCharType", "separate");
 	separate.appendChild(sepFld);
-	const resultRun = ownerDoc.createElementNS(w$15, "w:r");
-	const resultTextEl = ownerDoc.createElementNS(w$15, "w:t");
+	const resultRun = ownerDoc.createElementNS(w$16, "w:r");
+	const resultTextEl = ownerDoc.createElementNS(w$16, "w:t");
 	resultTextEl.setAttributeNS(XML_NS, "xml:space", "preserve");
 	resultTextEl.textContent = spec.initialResult ?? "";
 	resultRun.appendChild(resultTextEl);
-	const end = ownerDoc.createElementNS(w$15, "w:r");
-	const endFld = ownerDoc.createElementNS(w$15, "w:fldChar");
-	endFld.setAttributeNS(w$15, "w:fldCharType", "end");
+	const end = ownerDoc.createElementNS(w$16, "w:r");
+	const endFld = ownerDoc.createElementNS(w$16, "w:fldChar");
+	endFld.setAttributeNS(w$16, "w:fldCharType", "end");
 	end.appendChild(endFld);
 	const { instrTextSuffix } = applyFieldFormat([
 		begin,
@@ -2262,7 +2517,7 @@ function emitComplexField(ownerDoc, spec) {
 * Returns the field-code suffix to append (empty when no format). */
 function applyFieldFormat(fieldRuns, format, ownerDoc) {
 	if (!format) return { instrTextSuffix: "" };
-	const rPr = ownerDoc.createElementNS(w$15, "w:rPr");
+	const rPr = ownerDoc.createElementNS(w$16, "w:rPr");
 	for (const c of buildRPrChildren(format, ownerDoc)) rPr.appendChild(c);
 	if (rPr.childNodes.length === 0) return { instrTextSuffix: "" };
 	for (const r of fieldRuns) r.insertBefore(rPr.cloneNode(true), r.firstChild);
@@ -2355,22 +2610,22 @@ function emitInlineStyleRef(ownerDoc, info, numberOnly, format) {
 * by schema — CellBlockSchema excludes TableBlock. The grid occupancy
 * algorithm and continuation logic still applies to one-level tables.
 */
-const w$14 = NS.w;
+const w$15 = NS.w;
 function emitTableBlock(block, ownerDoc, ctx) {
 	const headerRows = block.headerRows ?? 0;
 	const { grid, effectiveCols } = buildGrid(block.rows, headerRows);
 	if (block.cols !== void 0 && block.cols.length !== effectiveCols) throw new Error(`table.cols length (${block.cols.length}) does not match effective column count (${effectiveCols}). Effective columns = max(declared cells per row + ongoing rowspan claims), expanded by colspans.`);
-	const tbl = ownerDoc.createElementNS(w$14, "w:tbl");
+	const tbl = ownerDoc.createElementNS(w$15, "w:tbl");
 	const usableWidth = ctx.usableWidthTwips ?? DEFAULT_USABLE_WIDTH_TWIPS;
 	const autoShareTwips = computeAutoShareTwips(block.cols, effectiveCols, usableWidth);
 	const tblPr = buildTblPr(block, autoShareTwips, usableWidth, ownerDoc);
 	tbl.appendChild(tblPr);
 	tbl.appendChild(buildTblGrid(block.cols, effectiveCols, autoShareTwips, ownerDoc));
 	for (let r = 0; r < grid.length; r++) {
-		const rowEl = ownerDoc.createElementNS(w$14, "w:tr");
+		const rowEl = ownerDoc.createElementNS(w$15, "w:tr");
 		if (r < headerRows) {
-			const trPr = ownerDoc.createElementNS(w$14, "w:trPr");
-			insertChildInOrder(trPr, ownerDoc.createElementNS(w$14, "w:tblHeader"), TR_PR_CHILD_ORDER);
+			const trPr = ownerDoc.createElementNS(w$15, "w:trPr");
+			insertChildInOrder(trPr, ownerDoc.createElementNS(w$15, "w:tblHeader"), TR_PR_CHILD_ORDER);
 			rowEl.appendChild(trPr);
 		}
 		for (const slot of grid[r]) rowEl.appendChild(buildTc(slot, block, ownerDoc, ctx));
@@ -2466,27 +2721,27 @@ function normalizeCell(cell) {
 * declare `cols` widths to match the cell. */
 const DEFAULT_USABLE_WIDTH_TWIPS = 8500;
 function buildTblPr(block, autoShareTwips, usableWidth, ownerDoc) {
-	const tblPr = ownerDoc.createElementNS(w$14, "w:tblPr");
+	const tblPr = ownerDoc.createElementNS(w$15, "w:tblPr");
 	if (block.alignment) {
-		const jc = ownerDoc.createElementNS(w$14, "w:jc");
-		jc.setAttributeNS(w$14, "w:val", block.alignment);
+		const jc = ownerDoc.createElementNS(w$15, "w:jc");
+		jc.setAttributeNS(w$15, "w:val", block.alignment);
 		insertChildInOrder(tblPr, jc, TBL_PR_CHILD_ORDER);
 	}
-	const tblW = ownerDoc.createElementNS(w$14, "w:tblW");
+	const tblW = ownerDoc.createElementNS(w$15, "w:tblW");
 	if (block.layout === "fixed") {
 		const totalTwips = computeFixedTotalTwips(block.cols, autoShareTwips, usableWidth);
-		tblW.setAttributeNS(w$14, "w:w", String(totalTwips));
-		tblW.setAttributeNS(w$14, "w:type", "dxa");
+		tblW.setAttributeNS(w$15, "w:w", String(totalTwips));
+		tblW.setAttributeNS(w$15, "w:type", "dxa");
 	} else {
-		tblW.setAttributeNS(w$14, "w:w", "0");
-		tblW.setAttributeNS(w$14, "w:type", "auto");
+		tblW.setAttributeNS(w$15, "w:w", "0");
+		tblW.setAttributeNS(w$15, "w:type", "auto");
 	}
 	insertChildInOrder(tblPr, tblW, TBL_PR_CHILD_ORDER);
 	const borders = resolveTableBorders(block);
 	if (borders) insertChildInOrder(tblPr, buildTblBorders(borders, ownerDoc), TBL_PR_CHILD_ORDER);
 	if (block.layout === "fixed") {
-		const tblLayout = ownerDoc.createElementNS(w$14, "w:tblLayout");
-		tblLayout.setAttributeNS(w$14, "w:type", "fixed");
+		const tblLayout = ownerDoc.createElementNS(w$15, "w:tblLayout");
+		tblLayout.setAttributeNS(w$15, "w:type", "fixed");
 		insertChildInOrder(tblPr, tblLayout, TBL_PR_CHILD_ORDER);
 	}
 	const tableEdges = resolveTablePadding(block);
@@ -2565,7 +2820,7 @@ function resolveTableBorders(block) {
 	};
 }
 function buildTblBorders(b, ownerDoc) {
-	const el = ownerDoc.createElementNS(w$14, "w:tblBorders");
+	const el = ownerDoc.createElementNS(w$15, "w:tblBorders");
 	for (const side of [
 		"top",
 		"left",
@@ -2581,7 +2836,7 @@ function buildTblBorders(b, ownerDoc) {
 	return el;
 }
 function buildTcBorders(b, ownerDoc) {
-	const el = ownerDoc.createElementNS(w$14, "w:tcBorders");
+	const el = ownerDoc.createElementNS(w$15, "w:tcBorders");
 	for (const side of [
 		"top",
 		"left",
@@ -2601,9 +2856,9 @@ function buildTcBorders(b, ownerDoc) {
 * tcBorders, space=0) and paragraph borders (pBdr, space=1 — text needs a
 * gap from the line). */
 function buildBorderElement(qname, edge, ownerDoc, space = 0) {
-	const el = ownerDoc.createElementNS(w$14, qname);
+	const el = ownerDoc.createElementNS(w$15, qname);
 	if (edge === "none") {
-		el.setAttributeNS(w$14, "w:val", "nil");
+		el.setAttributeNS(w$15, "w:val", "nil");
 		return el;
 	}
 	let style;
@@ -2621,10 +2876,10 @@ function buildBorderElement(qname, edge, ownerDoc, space = 0) {
 		color = edge.color ?? "auto";
 	}
 	if (style === "thick") style = "single";
-	el.setAttributeNS(w$14, "w:val", style);
-	el.setAttributeNS(w$14, "w:sz", String(Math.max(2, sizeEighthPt)));
-	el.setAttributeNS(w$14, "w:space", String(space));
-	el.setAttributeNS(w$14, "w:color", color);
+	el.setAttributeNS(w$15, "w:val", style);
+	el.setAttributeNS(w$15, "w:sz", String(Math.max(2, sizeEighthPt)));
+	el.setAttributeNS(w$15, "w:space", String(space));
+	el.setAttributeNS(w$15, "w:color", color);
 	return el;
 }
 /** Three-line preset default vertical padding. Without it, single-line cells
@@ -2647,7 +2902,7 @@ function resolveTablePadding(block) {
 	};
 }
 function buildCellMar(tagName, edges, doc) {
-	const el = doc.createElementNS(w$14, "w:" + tagName);
+	const el = doc.createElementNS(w$15, "w:" + tagName);
 	for (const side of [
 		"top",
 		"left",
@@ -2656,53 +2911,53 @@ function buildCellMar(tagName, edges, doc) {
 	]) {
 		const pt = edges[side];
 		if (pt === void 0) continue;
-		const child = doc.createElementNS(w$14, "w:" + side);
-		child.setAttributeNS(w$14, "w:w", String(Math.round(pt * 20)));
-		child.setAttributeNS(w$14, "w:type", "dxa");
+		const child = doc.createElementNS(w$15, "w:" + side);
+		child.setAttributeNS(w$15, "w:w", String(Math.round(pt * 20)));
+		child.setAttributeNS(w$15, "w:type", "dxa");
 		el.appendChild(child);
 	}
 	return el;
 }
 function buildTblGrid(cols, effectiveCols, autoShareTwips, ownerDoc) {
-	const grid = ownerDoc.createElementNS(w$14, "w:tblGrid");
+	const grid = ownerDoc.createElementNS(w$15, "w:tblGrid");
 	if (cols !== void 0) for (const c of cols) grid.appendChild(buildGridCol(c.width, autoShareTwips, ownerDoc));
 	else for (let i = 0; i < effectiveCols; i++) grid.appendChild(buildGridCol("auto", autoShareTwips, ownerDoc));
 	return grid;
 }
 function buildGridCol(width, autoTwips, ownerDoc) {
-	const col = ownerDoc.createElementNS(w$14, "w:gridCol");
+	const col = ownerDoc.createElementNS(w$15, "w:gridCol");
 	const twips = width === "auto" ? autoTwips : toTwips(width, "table.cols.width");
-	col.setAttributeNS(w$14, "w:w", String(twips));
+	col.setAttributeNS(w$15, "w:w", String(twips));
 	return col;
 }
 function buildTc(slot, block, ownerDoc, ctx) {
-	const tc = ownerDoc.createElementNS(w$14, "w:tc");
+	const tc = ownerDoc.createElementNS(w$15, "w:tc");
 	const tcPr = buildTcPr(slot, block, ownerDoc);
 	tc.appendChild(tcPr);
 	if (slot.kind === "vmerge-continue") {
-		tc.appendChild(ownerDoc.createElementNS(w$14, "w:p"));
+		tc.appendChild(ownerDoc.createElementNS(w$15, "w:p"));
 		return tc;
 	}
 	const blocks = emitCellContent(slot.cell, block, slot.isHeaderRow, ownerDoc, ctx);
-	if (blocks.length === 0) tc.appendChild(ownerDoc.createElementNS(w$14, "w:p"));
+	if (blocks.length === 0) tc.appendChild(ownerDoc.createElementNS(w$15, "w:p"));
 	else {
 		for (const el of blocks) tc.appendChild(el);
 		const last = blocks[blocks.length - 1];
-		if (last.namespaceURI === w$14 && last.localName === "tbl") tc.appendChild(ownerDoc.createElementNS(w$14, "w:p"));
+		if (last.namespaceURI === w$15 && last.localName === "tbl") tc.appendChild(ownerDoc.createElementNS(w$15, "w:p"));
 	}
 	return tc;
 }
 function buildTcPr(slot, block, ownerDoc) {
-	const tcPr = ownerDoc.createElementNS(w$14, "w:tcPr");
+	const tcPr = ownerDoc.createElementNS(w$15, "w:tcPr");
 	if (slot.colspan > 1) {
-		const gridSpan = ownerDoc.createElementNS(w$14, "w:gridSpan");
-		gridSpan.setAttributeNS(w$14, "w:val", String(slot.colspan));
+		const gridSpan = ownerDoc.createElementNS(w$15, "w:gridSpan");
+		gridSpan.setAttributeNS(w$15, "w:val", String(slot.colspan));
 		insertChildInOrder(tcPr, gridSpan, TC_PR_CHILD_ORDER);
 	}
-	if (slot.kind === "vmerge-continue") insertChildInOrder(tcPr, ownerDoc.createElementNS(w$14, "w:vMerge"), TC_PR_CHILD_ORDER);
+	if (slot.kind === "vmerge-continue") insertChildInOrder(tcPr, ownerDoc.createElementNS(w$15, "w:vMerge"), TC_PR_CHILD_ORDER);
 	else if (slot.rowspan > 1) {
-		const vMerge = ownerDoc.createElementNS(w$14, "w:vMerge");
-		vMerge.setAttributeNS(w$14, "w:val", "restart");
+		const vMerge = ownerDoc.createElementNS(w$15, "w:vMerge");
+		vMerge.setAttributeNS(w$15, "w:val", "restart");
 		insertChildInOrder(tcPr, vMerge, TC_PR_CHILD_ORDER);
 	}
 	const cellBorders = slot.cell.borders;
@@ -2713,17 +2968,17 @@ function buildTcPr(slot, block, ownerDoc) {
 		insertChildInOrder(tcPr, buildTcBorders(merged, ownerDoc), TC_PR_CHILD_ORDER);
 	}
 	if (slot.cell.shading) {
-		const shd = ownerDoc.createElementNS(w$14, "w:shd");
-		shd.setAttributeNS(w$14, "w:val", "clear");
-		shd.setAttributeNS(w$14, "w:color", "auto");
-		shd.setAttributeNS(w$14, "w:fill", slot.cell.shading);
+		const shd = ownerDoc.createElementNS(w$15, "w:shd");
+		shd.setAttributeNS(w$15, "w:val", "clear");
+		shd.setAttributeNS(w$15, "w:color", "auto");
+		shd.setAttributeNS(w$15, "w:fill", slot.cell.shading);
 		insertChildInOrder(tcPr, shd, TC_PR_CHILD_ORDER);
 	}
 	if (slot.cell.padding !== void 0 && slot.kind !== "vmerge-continue") insertChildInOrder(tcPr, buildCellMar("tcMar", parsePadding(slot.cell.padding, "cell.padding"), ownerDoc), TC_PR_CHILD_ORDER);
 	if (slot.kind !== "vmerge-continue") {
 		const resolvedVAlign = slot.cell.vAlign ?? block.vAlign ?? "center";
-		const vAlign = ownerDoc.createElementNS(w$14, "w:vAlign");
-		vAlign.setAttributeNS(w$14, "w:val", resolvedVAlign);
+		const vAlign = ownerDoc.createElementNS(w$15, "w:vAlign");
+		vAlign.setAttributeNS(w$15, "w:val", resolvedVAlign);
 		insertChildInOrder(tcPr, vAlign, TC_PR_CHILD_ORDER);
 	}
 	return tcPr;
@@ -2756,7 +3011,7 @@ function emitCellContent(cell, block, isHeaderRow, ownerDoc, ctx) {
 		const out = [];
 		for (const b of content) {
 			const el = emitBlock(b, ownerDoc, ctx);
-			if (headerStyle && el.namespaceURI === w$14 && el.localName === "p" && !hasPStyle(el)) applyDefaultPStyle(el, headerStyle, ownerDoc);
+			if (headerStyle && el.namespaceURI === w$15 && el.localName === "p" && !hasPStyle(el)) applyDefaultPStyle(el, headerStyle, ownerDoc);
 			out.push(el);
 		}
 		return out;
@@ -2764,31 +3019,31 @@ function emitCellContent(cell, block, isHeaderRow, ownerDoc, ctx) {
 	return [emitParagraphFromRichText(content, headerStyle, ownerDoc, ctx)];
 }
 function emitParagraphFromText(text, headerStyle, ownerDoc, ctx) {
-	const p = ownerDoc.createElementNS(w$14, "w:p");
+	const p = ownerDoc.createElementNS(w$15, "w:p");
 	if (headerStyle) applyDefaultPStyle(p, headerStyle, ownerDoc);
 	for (const r of emitRichText(text, ownerDoc, ctx, void 0)) p.appendChild(r);
 	return p;
 }
 function emitParagraphFromRichText(inline, headerStyle, ownerDoc, ctx) {
-	const p = ownerDoc.createElementNS(w$14, "w:p");
+	const p = ownerDoc.createElementNS(w$15, "w:p");
 	if (headerStyle) applyDefaultPStyle(p, headerStyle, ownerDoc);
 	for (const r of emitRichText(inline, ownerDoc, ctx, void 0)) p.appendChild(r);
 	return p;
 }
 function hasPStyle(p) {
-	const pPr = firstChildNS(p, w$14, "pPr");
+	const pPr = firstChildNS(p, w$15, "pPr");
 	if (!pPr) return false;
-	return firstChildNS(pPr, w$14, "pStyle") !== null;
+	return firstChildNS(pPr, w$15, "pStyle") !== null;
 }
 function applyDefaultPStyle(p, styleId, ownerDoc) {
-	let pPr = firstChildNS(p, w$14, "pPr");
+	let pPr = firstChildNS(p, w$15, "pPr");
 	if (!pPr) {
-		pPr = ownerDoc.createElementNS(w$14, "w:pPr");
+		pPr = ownerDoc.createElementNS(w$15, "w:pPr");
 		p.insertBefore(pPr, p.firstChild);
 	}
-	if (firstChildNS(pPr, w$14, "pStyle")) return;
-	const pStyle = ownerDoc.createElementNS(w$14, "w:pStyle");
-	pStyle.setAttributeNS(w$14, "w:val", styleId);
+	if (firstChildNS(pPr, w$15, "pStyle")) return;
+	const pStyle = ownerDoc.createElementNS(w$15, "w:pStyle");
+	pStyle.setAttributeNS(w$15, "w:val", styleId);
 	pPr.insertBefore(pStyle, pPr.firstChild);
 }
 /**
@@ -2806,9 +3061,9 @@ function applyDefaultPStyle(p, styleId, ownerDoc) {
 * for both body and cell containers.
 */
 function normalizeTableSequencing(container, ownerDoc) {
-	const isTbl = (el) => el.namespaceURI === w$14 && el.localName === "tbl";
-	const isSectPr = (el) => el.namespaceURI === w$14 && el.localName === "sectPr";
-	const newP = () => ownerDoc.createElementNS(w$14, "w:p");
+	const isTbl = (el) => el.namespaceURI === w$15 && el.localName === "tbl";
+	const isSectPr = (el) => el.namespaceURI === w$15 && el.localName === "sectPr";
+	const newP = () => ownerDoc.createElementNS(w$15, "w:p");
 	const children = getChildren(container);
 	for (let i = 0; i < children.length - 1; i++) {
 		const cur = children[i];
@@ -3905,7 +4160,7 @@ function emitStyleRefField(ownerDoc, spec) {
 * `bookmark` option; emit emits bookmarkStart/End around the correct
 * range. When `bookmark` is omitted, no bookmark is emitted.
 */
-const w$13 = NS.w;
+const w$14 = NS.w;
 const m$2 = NS.m;
 /** SEQ identifier for the hidden chapter counter paired with a heading
 * style under chapterPrefix `format` override. Engine reserves the
@@ -3967,7 +4222,8 @@ function emitCaptionBlock(ownerDoc, opts) {
 		subGroup: opts.subGroup,
 		chapterPrefixResults: built.chapterPrefixResults,
 		parentSeqResult: built.parentSeqResult,
-		subSeqResult: built.subSeqResult
+		subSeqResult: built.subSeqResult,
+		bodyText: opts.text === "" ? void 0 : opts.text
 	};
 	return {
 		paragraph: built.paragraph,
@@ -3981,10 +4237,10 @@ function emitCaptionBlock(ownerDoc, opts) {
 * intent ("the next caption is newValue"), emit `\r (newValue - 1)`.
 * Counter sim mirrors the same convention. */
 function emitCaptionReset(ownerDoc, opts) {
-	const p = ownerDoc.createElementNS(w$13, "w:p");
-	const pPr = ownerDoc.createElementNS(w$13, "w:pPr");
-	const pStyle = ownerDoc.createElementNS(w$13, "w:pStyle");
-	pStyle.setAttributeNS(w$13, "w:val", "Normal");
+	const p = ownerDoc.createElementNS(w$14, "w:p");
+	const pPr = ownerDoc.createElementNS(w$14, "w:pPr");
+	const pStyle = ownerDoc.createElementNS(w$14, "w:pStyle");
+	pStyle.setAttributeNS(w$14, "w:val", "Normal");
 	pPr.appendChild(pStyle);
 	p.appendChild(pPr);
 	const { runs } = emitSeqField(ownerDoc, {
@@ -4013,9 +4269,9 @@ function buildCaptionRunSequence(ownerDoc, opts) {
 	const config = opts.captionConfig;
 	const runs = [];
 	if (opts.bookmark) {
-		const bmStart = ownerDoc.createElementNS(w$13, "w:bookmarkStart");
-		bmStart.setAttributeNS(w$13, "w:id", String(opts.bookmark.id));
-		bmStart.setAttributeNS(w$13, "w:name", opts.bookmark.name);
+		const bmStart = ownerDoc.createElementNS(w$14, "w:bookmarkStart");
+		bmStart.setAttributeNS(w$14, "w:id", String(opts.bookmark.id));
+		bmStart.setAttributeNS(w$14, "w:name", opts.bookmark.name);
 		runs.push(bmStart);
 	}
 	if (config.prefix !== "") runs.push(buildPlainTextRun(ownerDoc, config.prefix));
@@ -4062,8 +4318,8 @@ function buildCaptionRunSequence(ownerDoc, opts) {
 	}
 	if (config.suffix !== "") runs.push(buildPlainTextRun(ownerDoc, config.suffix));
 	if (opts.bookmark) {
-		const bmEnd = ownerDoc.createElementNS(w$13, "w:bookmarkEnd");
-		bmEnd.setAttributeNS(w$13, "w:id", String(opts.bookmark.id));
+		const bmEnd = ownerDoc.createElementNS(w$14, "w:bookmarkEnd");
+		bmEnd.setAttributeNS(w$14, "w:id", String(opts.bookmark.id));
 		runs.push(bmEnd);
 	}
 	if (opts.body !== void 0) {
@@ -4078,10 +4334,10 @@ function buildCaptionRunSequence(ownerDoc, opts) {
 	};
 }
 function buildCaptionParagraph(ownerDoc, opts) {
-	const p = ownerDoc.createElementNS(w$13, "w:p");
-	const pPr = ownerDoc.createElementNS(w$13, "w:pPr");
-	const pStyle = ownerDoc.createElementNS(w$13, "w:pStyle");
-	pStyle.setAttributeNS(w$13, "w:val", opts.captionConfig.paragraphStyleId);
+	const p = ownerDoc.createElementNS(w$14, "w:p");
+	const pPr = ownerDoc.createElementNS(w$14, "w:pPr");
+	const pStyle = ownerDoc.createElementNS(w$14, "w:pStyle");
+	pStyle.setAttributeNS(w$14, "w:val", opts.captionConfig.paragraphStyleId);
 	pPr.appendChild(pStyle);
 	p.appendChild(pPr);
 	const seq = buildCaptionRunSequence(ownerDoc, opts);
@@ -4094,10 +4350,10 @@ function buildCaptionParagraph(ownerDoc, opts) {
 	};
 }
 function centeredEquationParagraph(ownerDoc, source, equationStyleId) {
-	const p = ownerDoc.createElementNS(w$13, "w:p");
-	const pPr = ownerDoc.createElementNS(w$13, "w:pPr");
-	const pStyle = ownerDoc.createElementNS(w$13, "w:pStyle");
-	pStyle.setAttributeNS(w$13, "w:val", equationStyleId);
+	const p = ownerDoc.createElementNS(w$14, "w:p");
+	const pPr = ownerDoc.createElementNS(w$14, "w:pPr");
+	const pStyle = ownerDoc.createElementNS(w$14, "w:pStyle");
+	pStyle.setAttributeNS(w$14, "w:val", equationStyleId);
 	pPr.appendChild(pStyle);
 	p.appendChild(pPr);
 	const oMath = buildOMath(source, ownerDoc, true);
@@ -4107,27 +4363,27 @@ function centeredEquationParagraph(ownerDoc, source, equationStyleId) {
 	return p;
 }
 function emptyParagraph(ownerDoc) {
-	return ownerDoc.createElementNS(w$13, "w:p");
+	return ownerDoc.createElementNS(w$14, "w:p");
 }
 function buildCell(ownerDoc, widthTwips, content) {
-	const tc = ownerDoc.createElementNS(w$13, "w:tc");
-	const tcPr = ownerDoc.createElementNS(w$13, "w:tcPr");
-	const tcW = ownerDoc.createElementNS(w$13, "w:tcW");
-	tcW.setAttributeNS(w$13, "w:w", String(widthTwips));
-	tcW.setAttributeNS(w$13, "w:type", "dxa");
+	const tc = ownerDoc.createElementNS(w$14, "w:tc");
+	const tcPr = ownerDoc.createElementNS(w$14, "w:tcPr");
+	const tcW = ownerDoc.createElementNS(w$14, "w:tcW");
+	tcW.setAttributeNS(w$14, "w:w", String(widthTwips));
+	tcW.setAttributeNS(w$14, "w:type", "dxa");
 	tcPr.appendChild(tcW);
 	tc.appendChild(tcPr);
 	for (const c of content) tc.appendChild(c);
 	return tc;
 }
 function buildBorderlessTable(ownerDoc, colWidths, cells) {
-	const tbl = ownerDoc.createElementNS(w$13, "w:tbl");
-	const tblPr = ownerDoc.createElementNS(w$13, "w:tblPr");
-	const tblW = ownerDoc.createElementNS(w$13, "w:tblW");
-	tblW.setAttributeNS(w$13, "w:w", String(colWidths.reduce((a, b) => a + b, 0)));
-	tblW.setAttributeNS(w$13, "w:type", "dxa");
+	const tbl = ownerDoc.createElementNS(w$14, "w:tbl");
+	const tblPr = ownerDoc.createElementNS(w$14, "w:tblPr");
+	const tblW = ownerDoc.createElementNS(w$14, "w:tblW");
+	tblW.setAttributeNS(w$14, "w:w", String(colWidths.reduce((a, b) => a + b, 0)));
+	tblW.setAttributeNS(w$14, "w:type", "dxa");
 	tblPr.appendChild(tblW);
-	const borders = ownerDoc.createElementNS(w$13, "w:tblBorders");
+	const borders = ownerDoc.createElementNS(w$14, "w:tblBorders");
 	for (const edge of [
 		"top",
 		"left",
@@ -4136,25 +4392,25 @@ function buildBorderlessTable(ownerDoc, colWidths, cells) {
 		"insideH",
 		"insideV"
 	]) {
-		const b = ownerDoc.createElementNS(w$13, `w:${edge}`);
-		b.setAttributeNS(w$13, "w:val", "none");
-		b.setAttributeNS(w$13, "w:sz", "0");
-		b.setAttributeNS(w$13, "w:color", "auto");
+		const b = ownerDoc.createElementNS(w$14, `w:${edge}`);
+		b.setAttributeNS(w$14, "w:val", "none");
+		b.setAttributeNS(w$14, "w:sz", "0");
+		b.setAttributeNS(w$14, "w:color", "auto");
 		borders.appendChild(b);
 	}
 	tblPr.appendChild(borders);
-	const layout = ownerDoc.createElementNS(w$13, "w:tblLayout");
-	layout.setAttributeNS(w$13, "w:type", "fixed");
+	const layout = ownerDoc.createElementNS(w$14, "w:tblLayout");
+	layout.setAttributeNS(w$14, "w:type", "fixed");
 	tblPr.appendChild(layout);
 	tbl.appendChild(tblPr);
-	const tblGrid = ownerDoc.createElementNS(w$13, "w:tblGrid");
+	const tblGrid = ownerDoc.createElementNS(w$14, "w:tblGrid");
 	for (const width of colWidths) {
-		const gc = ownerDoc.createElementNS(w$13, "w:gridCol");
-		gc.setAttributeNS(w$13, "w:w", String(width));
+		const gc = ownerDoc.createElementNS(w$14, "w:gridCol");
+		gc.setAttributeNS(w$14, "w:w", String(width));
 		tblGrid.appendChild(gc);
 	}
 	tbl.appendChild(tblGrid);
-	const tr = ownerDoc.createElementNS(w$13, "w:tr");
+	const tr = ownerDoc.createElementNS(w$14, "w:tr");
 	for (const c of cells) tr.appendChild(c);
 	tbl.appendChild(tr);
 	return tbl;
@@ -4174,7 +4430,7 @@ function buildBorderlessTable(ownerDoc, colWidths, cells) {
 * these on import, so the result serializes correctly without needing to
 * touch the document root's namespace declarations.
 */
-const w$12 = NS.w;
+const w$13 = NS.w;
 const m$1 = NS.m;
 function emitEquationBlock(block, ownerDoc, ctx) {
 	if (block.captionId !== void 0) return emitNumberedEquationDispatch(block, block.captionId, ownerDoc, ctx);
@@ -4200,12 +4456,12 @@ function emitNumberedEquationDispatch(block, captionId, ownerDoc, ctx) {
 	return table;
 }
 function emitUnnumberedEquationLegacy(block, ownerDoc, ctx) {
-	const p = ownerDoc.createElementNS(w$12, "w:p");
+	const p = ownerDoc.createElementNS(w$13, "w:p");
 	if (block.styleId !== void 0 || block.paraFormat !== void 0) {
-		const pPr = ownerDoc.createElementNS(w$12, "w:pPr");
+		const pPr = ownerDoc.createElementNS(w$13, "w:pPr");
 		if (block.styleId) {
-			const ps = ownerDoc.createElementNS(w$12, "w:pStyle");
-			ps.setAttributeNS(w$12, "w:val", block.styleId);
+			const ps = ownerDoc.createElementNS(w$13, "w:pStyle");
+			ps.setAttributeNS(w$13, "w:val", block.styleId);
 			pPr.appendChild(ps);
 		}
 		if (block.paraFormat) for (const c of buildPPrChildren(block.paraFormat, ownerDoc)) pPr.appendChild(c);
@@ -4248,33 +4504,33 @@ function emitInlineEquation(latex, ownerDoc) {
 * supplies the callback when image assets are available; absent callback +
 * `image` block = error (Step 7 plumbs this in via image-asset.ts).
 */
-const w$11 = NS.w;
+const w$12 = NS.w;
 /** OOXML toggle element: presence-only when `on=true`, val="0" when false. */
 function toggleElement(ownerDoc, qname, on) {
-	const el = ownerDoc.createElementNS(w$11, qname);
-	if (!on) el.setAttributeNS(w$11, "w:val", "0");
+	const el = ownerDoc.createElementNS(w$12, qname);
+	if (!on) el.setAttributeNS(w$12, "w:val", "0");
 	return el;
 }
 function buildRPrChildren(fmt, ownerDoc) {
 	const out = [];
 	if (fmt.fontLatin || fmt.fontCJK) {
-		const rFonts = ownerDoc.createElementNS(w$11, "w:rFonts");
+		const rFonts = ownerDoc.createElementNS(w$12, "w:rFonts");
 		const ascii = fmt.fontLatin ?? fmt.fontCJK ?? "";
 		const ea = fmt.fontCJK ?? fmt.fontLatin ?? "";
 		if (ascii) {
-			rFonts.setAttributeNS(w$11, "w:ascii", ascii);
-			rFonts.setAttributeNS(w$11, "w:hAnsi", ascii);
+			rFonts.setAttributeNS(w$12, "w:ascii", ascii);
+			rFonts.setAttributeNS(w$12, "w:hAnsi", ascii);
 		}
-		if (ea) rFonts.setAttributeNS(w$11, "w:eastAsia", ea);
+		if (ea) rFonts.setAttributeNS(w$12, "w:eastAsia", ea);
 		out.push(rFonts);
 	}
 	if (fmt.size !== void 0) {
 		const halfPt = toHalfPt(fmt.size, "size");
-		const sz = ownerDoc.createElementNS(w$11, "w:sz");
-		sz.setAttributeNS(w$11, "w:val", String(halfPt));
+		const sz = ownerDoc.createElementNS(w$12, "w:sz");
+		sz.setAttributeNS(w$12, "w:val", String(halfPt));
 		out.push(sz);
-		const szCs = ownerDoc.createElementNS(w$11, "w:szCs");
-		szCs.setAttributeNS(w$11, "w:val", String(halfPt));
+		const szCs = ownerDoc.createElementNS(w$12, "w:szCs");
+		szCs.setAttributeNS(w$12, "w:val", String(halfPt));
 		out.push(szCs);
 	}
 	if (fmt.bold !== void 0) {
@@ -4286,19 +4542,19 @@ function buildRPrChildren(fmt, ownerDoc) {
 		out.push(toggleElement(ownerDoc, "w:iCs", fmt.italic));
 	}
 	if (fmt.underline !== void 0) {
-		const u = ownerDoc.createElementNS(w$11, "w:u");
-		u.setAttributeNS(w$11, "w:val", fmt.underline ? "single" : "none");
+		const u = ownerDoc.createElementNS(w$12, "w:u");
+		u.setAttributeNS(w$12, "w:val", fmt.underline ? "single" : "none");
 		out.push(u);
 	}
 	if (fmt.strike !== void 0) out.push(toggleElement(ownerDoc, "w:strike", fmt.strike));
 	if (fmt.color) {
-		const c = ownerDoc.createElementNS(w$11, "w:color");
-		c.setAttributeNS(w$11, "w:val", fmt.color);
+		const c = ownerDoc.createElementNS(w$12, "w:color");
+		c.setAttributeNS(w$12, "w:val", fmt.color);
 		out.push(c);
 	}
 	if (fmt.vertAlign) {
-		const va = ownerDoc.createElementNS(w$11, "w:vertAlign");
-		va.setAttributeNS(w$11, "w:val", fmt.vertAlign);
+		const va = ownerDoc.createElementNS(w$12, "w:vertAlign");
+		va.setAttributeNS(w$12, "w:val", fmt.vertAlign);
 		out.push(va);
 	}
 	const orderIdx = (el) => {
@@ -4333,48 +4589,36 @@ const RPR_MANAGED_LOCAL_NAMES = new Set([
 function buildPPrChildren(fmt, ownerDoc) {
 	const out = [];
 	if (fmt.spaceBefore !== void 0 || fmt.spaceAfter !== void 0 || fmt.lineSpacing !== void 0) {
-		const spacing = ownerDoc.createElementNS(w$11, "w:spacing");
-		if (fmt.spaceBefore !== void 0) spacing.setAttributeNS(w$11, "w:before", String(toTwips(fmt.spaceBefore, "spaceBefore")));
-		if (fmt.spaceAfter !== void 0) spacing.setAttributeNS(w$11, "w:after", String(toTwips(fmt.spaceAfter, "spaceAfter")));
+		const spacing = ownerDoc.createElementNS(w$12, "w:spacing");
+		if (fmt.spaceBefore !== void 0) spacing.setAttributeNS(w$12, "w:before", String(toTwips(fmt.spaceBefore, "spaceBefore")));
+		if (fmt.spaceAfter !== void 0) spacing.setAttributeNS(w$12, "w:after", String(toTwips(fmt.spaceAfter, "spaceAfter")));
 		if (fmt.lineSpacing !== void 0) {
 			const ls = parseLineSpacing(fmt.lineSpacing, "lineSpacing");
-			spacing.setAttributeNS(w$11, "w:line", String(ls.value));
-			spacing.setAttributeNS(w$11, "w:lineRule", ls.mode);
+			spacing.setAttributeNS(w$12, "w:line", String(ls.value));
+			spacing.setAttributeNS(w$12, "w:lineRule", ls.mode);
 		}
 		out.push(spacing);
 	}
 	if (fmt.firstLineIndent != null || fmt.hangingIndent != null || fmt.indentLeft != null || fmt.indentRight != null) {
-		const ind = ownerDoc.createElementNS(w$11, "w:ind");
+		const ind = ownerDoc.createElementNS(w$12, "w:ind");
 		const fli = parseIndent(fmt.firstLineIndent ?? null);
-		if (fli && fli.value !== 0) {
-			const attr = fli.kind === "char" ? "w:firstLineChars" : "w:firstLine";
-			ind.setAttributeNS(w$11, attr, String(fli.value));
-		}
+		if (fli) setIndentAttr(ind, "firstLine", fli);
 		const hi = parseIndent(fmt.hangingIndent ?? null);
-		if (hi && hi.value !== 0) {
-			const attr = hi.kind === "char" ? "w:hangingChars" : "w:hanging";
-			ind.setAttributeNS(w$11, attr, String(hi.value));
-		}
+		if (hi) setIndentAttr(ind, "hanging", hi);
 		const il = parseIndent(fmt.indentLeft ?? null);
-		if (il) {
-			const attr = il.kind === "char" ? "w:leftChars" : "w:left";
-			ind.setAttributeNS(w$11, attr, String(il.value));
-		}
+		if (il) setIndentAttr(ind, "left", il);
 		const ir = parseIndent(fmt.indentRight ?? null);
-		if (ir) {
-			const attr = ir.kind === "char" ? "w:rightChars" : "w:right";
-			ind.setAttributeNS(w$11, attr, String(ir.value));
-		}
+		if (ir) setIndentAttr(ind, "right", ir);
 		out.push(ind);
 	}
 	if (fmt.alignment) {
-		const jc = ownerDoc.createElementNS(w$11, "w:jc");
-		jc.setAttributeNS(w$11, "w:val", fmt.alignment);
+		const jc = ownerDoc.createElementNS(w$12, "w:jc");
+		jc.setAttributeNS(w$12, "w:val", fmt.alignment);
 		out.push(jc);
 	}
 	if (fmt.outlineLevel !== void 0) {
-		const ol = ownerDoc.createElementNS(w$11, "w:outlineLvl");
-		ol.setAttributeNS(w$11, "w:val", String(fmt.outlineLevel));
+		const ol = ownerDoc.createElementNS(w$12, "w:outlineLvl");
+		ol.setAttributeNS(w$12, "w:val", String(fmt.outlineLevel));
 		out.push(ol);
 	}
 	return out;
@@ -4389,13 +4633,13 @@ const PPR_MANAGED_LOCAL_NAMES = new Set([
 	"outlineLvl"
 ]);
 function emitRun(text, format, ownerDoc) {
-	const r = ownerDoc.createElementNS(w$11, "w:r");
+	const r = ownerDoc.createElementNS(w$12, "w:r");
 	if (format) {
-		const rPr = ownerDoc.createElementNS(w$11, "w:rPr");
+		const rPr = ownerDoc.createElementNS(w$12, "w:rPr");
 		for (const c of buildRPrChildren(format, ownerDoc)) rPr.appendChild(c);
 		if (rPr.childNodes.length > 0) r.appendChild(rPr);
 	}
-	const t = ownerDoc.createElementNS(w$11, "w:t");
+	const t = ownerDoc.createElementNS(w$12, "w:t");
 	t.setAttribute("xml:space", "preserve");
 	t.appendChild(ownerDoc.createTextNode(text));
 	r.appendChild(t);
@@ -4434,6 +4678,14 @@ function emitRichText(rt, ownerDoc, ctx, defaultFormat) {
 			for (const r of emitInlineStyleRef(ownerDoc, info, piece.numberOnly ?? false, fmt)) out.push(r);
 			continue;
 		}
+		if ("break" in piece) {
+			const r = ownerDoc.createElementNS(w$12, "w:r");
+			const br = ownerDoc.createElementNS(w$12, "w:br");
+			if (piece.break !== "line") br.setAttributeNS(w$12, "w:type", piece.break);
+			r.appendChild(br);
+			out.push(r);
+			continue;
+		}
 		out.push(emitRun(piece.text, piece.format ?? defaultFormat, ownerDoc));
 	}
 	return out;
@@ -4441,28 +4693,31 @@ function emitRichText(rt, ownerDoc, ctx, defaultFormat) {
 function ensurePPr(p, ownerDoc) {
 	for (const c of Array.from(p.childNodes)) if (c.nodeType === 1) {
 		const el = c;
-		if (el.namespaceURI === w$11 && el.localName === "pPr") return el;
+		if (el.namespaceURI === w$12 && el.localName === "pPr") return el;
 	}
-	const pPr = ownerDoc.createElementNS(w$11, "w:pPr");
+	const pPr = ownerDoc.createElementNS(w$12, "w:pPr");
 	p.insertBefore(pPr, p.firstChild);
 	return pPr;
 }
 function emitParagraphBlock(block, ownerDoc, ctx) {
-	const p = ownerDoc.createElementNS(w$11, "w:p");
+	const p = ownerDoc.createElementNS(w$12, "w:p");
 	if (block.styleId !== void 0 || block.paraFormat !== void 0 || block.numbering !== void 0) {
 		const pPr = ensurePPr(p, ownerDoc);
 		if (block.styleId) {
-			const ps = ownerDoc.createElementNS(w$11, "w:pStyle");
-			ps.setAttributeNS(w$11, "w:val", block.styleId);
+			const ps = ownerDoc.createElementNS(w$12, "w:pStyle");
+			ps.setAttributeNS(w$12, "w:val", block.styleId);
 			pPr.appendChild(ps);
 		}
-		if (block.numbering) {
-			const numPr = ownerDoc.createElementNS(w$11, "w:numPr");
-			const ilvl = ownerDoc.createElementNS(w$11, "w:ilvl");
-			ilvl.setAttributeNS(w$11, "w:val", String(block.numbering.level));
+		if (block.numbering) if (block.numbering.restart) {
+			if (!ctx.forkNumRestart) throw new Error("ParagraphBlock.numbering.restart: true requires numberingDoc to be available. Pass numberingDoc in RunEditOpsInput (apply-styles always does; standalone edit runs need it when using numbering.restart).");
+			ctx.forkNumRestart(p, block.numbering.numId, block.numbering.level);
+		} else {
+			const numPr = ownerDoc.createElementNS(w$12, "w:numPr");
+			const ilvl = ownerDoc.createElementNS(w$12, "w:ilvl");
+			ilvl.setAttributeNS(w$12, "w:val", String(block.numbering.level));
 			numPr.appendChild(ilvl);
-			const numId = ownerDoc.createElementNS(w$11, "w:numId");
-			numId.setAttributeNS(w$11, "w:val", block.numbering.numId);
+			const numId = ownerDoc.createElementNS(w$12, "w:numId");
+			numId.setAttributeNS(w$12, "w:val", block.numbering.numId);
 			numPr.appendChild(numId);
 			pPr.appendChild(numPr);
 		}
@@ -4478,39 +4733,39 @@ function emitParagraphBlock(block, ownerDoc, ctx) {
 function emitImageBlock(block, ownerDoc, ctx) {
 	if (!ctx.emitImage) throw new Error("image block encountered but no ImageEmitter wired (image asset path inactive)");
 	const drawing = ctx.emitImage(block.src, block.width, block.height, block.alt, ownerDoc);
-	const p = ownerDoc.createElementNS(w$11, "w:p");
+	const p = ownerDoc.createElementNS(w$12, "w:p");
 	if (block.styleId !== void 0 || block.paraFormat !== void 0) {
 		const pPr = ensurePPr(p, ownerDoc);
 		if (block.styleId) {
-			const ps = ownerDoc.createElementNS(w$11, "w:pStyle");
-			ps.setAttributeNS(w$11, "w:val", block.styleId);
+			const ps = ownerDoc.createElementNS(w$12, "w:pStyle");
+			ps.setAttributeNS(w$12, "w:val", block.styleId);
 			pPr.appendChild(ps);
 		}
 		if (block.paraFormat) for (const c of buildPPrChildren(block.paraFormat, ownerDoc)) pPr.appendChild(c);
 	}
-	const r = ownerDoc.createElementNS(w$11, "w:r");
+	const r = ownerDoc.createElementNS(w$12, "w:r");
 	r.appendChild(drawing);
 	p.appendChild(r);
 	return p;
 }
 function emitPageBreakBlock(ownerDoc) {
-	const p = ownerDoc.createElementNS(w$11, "w:p");
-	const r = ownerDoc.createElementNS(w$11, "w:r");
-	const br = ownerDoc.createElementNS(w$11, "w:br");
-	br.setAttributeNS(w$11, "w:type", "page");
+	const p = ownerDoc.createElementNS(w$12, "w:p");
+	const r = ownerDoc.createElementNS(w$12, "w:r");
+	const br = ownerDoc.createElementNS(w$12, "w:br");
+	br.setAttributeNS(w$12, "w:type", "page");
 	r.appendChild(br);
 	p.appendChild(r);
 	return p;
 }
 function emitHorizontalRuleBlock(ownerDoc) {
-	const p = ownerDoc.createElementNS(w$11, "w:p");
+	const p = ownerDoc.createElementNS(w$12, "w:p");
 	const pPr = ensurePPr(p, ownerDoc);
-	const pBdr = ownerDoc.createElementNS(w$11, "w:pBdr");
-	const bottom = ownerDoc.createElementNS(w$11, "w:bottom");
-	bottom.setAttributeNS(w$11, "w:val", "single");
-	bottom.setAttributeNS(w$11, "w:sz", "6");
-	bottom.setAttributeNS(w$11, "w:space", "1");
-	bottom.setAttributeNS(w$11, "w:color", "auto");
+	const pBdr = ownerDoc.createElementNS(w$12, "w:pBdr");
+	const bottom = ownerDoc.createElementNS(w$12, "w:bottom");
+	bottom.setAttributeNS(w$12, "w:val", "single");
+	bottom.setAttributeNS(w$12, "w:sz", "6");
+	bottom.setAttributeNS(w$12, "w:space", "1");
+	bottom.setAttributeNS(w$12, "w:color", "auto");
 	pBdr.appendChild(bottom);
 	pPr.appendChild(pBdr);
 	return p;
@@ -4571,17 +4826,17 @@ function emitFragment(fragment, ownerDoc, ctx) {
 * fixed for the run). The schema (ECMA-376 §17.13) requires both
 * attributes; we emit empty author since identity is not in scope.
 */
-const w$10 = NS.w;
+const w$11 = NS.w;
 /**
 * Wrap a list of paragraph children (typically <w:r> elements) inside a
 * single <w:ins>. The caller passes the already-built run nodes; this just
 * groups them. Returns the <w:ins> element ready to insert.
 */
 function wrapInsertion(runs, ownerDoc, ctx) {
-	const ins = ownerDoc.createElementNS(w$10, "w:ins");
-	ins.setAttributeNS(w$10, "w:id", String(ctx.nextId()));
-	ins.setAttributeNS(w$10, "w:author", ctx.author);
-	ins.setAttributeNS(w$10, "w:date", ctx.date);
+	const ins = ownerDoc.createElementNS(w$11, "w:ins");
+	ins.setAttributeNS(w$11, "w:id", String(ctx.nextId()));
+	ins.setAttributeNS(w$11, "w:author", ctx.author);
+	ins.setAttributeNS(w$11, "w:date", ctx.date);
 	for (const r of runs) ins.appendChild(r);
 	return ins;
 }
@@ -4592,10 +4847,10 @@ function wrapInsertion(runs, ownerDoc, ctx) {
 * responsible for splicing the returned element back into the tree.
 */
 function wrapDeletion(runs, ownerDoc, ctx) {
-	const del = ownerDoc.createElementNS(w$10, "w:del");
-	del.setAttributeNS(w$10, "w:id", String(ctx.nextId()));
-	del.setAttributeNS(w$10, "w:author", ctx.author);
-	del.setAttributeNS(w$10, "w:date", ctx.date);
+	const del = ownerDoc.createElementNS(w$11, "w:del");
+	del.setAttributeNS(w$11, "w:id", String(ctx.nextId()));
+	del.setAttributeNS(w$11, "w:author", ctx.author);
+	del.setAttributeNS(w$11, "w:date", ctx.date);
 	for (const r of runs) {
 		convertTtoDelText(r, ownerDoc);
 		del.appendChild(r);
@@ -4603,13 +4858,13 @@ function wrapDeletion(runs, ownerDoc, ctx) {
 	return del;
 }
 function convertTtoDelText(node, ownerDoc) {
-	for (const child of Array.from(getChildren(node))) if (child.namespaceURI === w$10) if (child.localName === "t") replaceLocalName(child, "w:delText", ownerDoc);
+	for (const child of Array.from(getChildren(node))) if (child.namespaceURI === w$11) if (child.localName === "t") replaceLocalName(child, "w:delText", ownerDoc);
 	else if (child.localName === "instrText") replaceLocalName(child, "w:delInstrText", ownerDoc);
 	else convertTtoDelText(child, ownerDoc);
 	else convertTtoDelText(child, ownerDoc);
 }
 function replaceLocalName(el, qname, ownerDoc) {
-	const rep = ownerDoc.createElementNS(w$10, qname);
+	const rep = ownerDoc.createElementNS(w$11, qname);
 	for (let i = 0; i < el.attributes.length; i++) {
 		const attr = el.attributes[i];
 		if (attr.namespaceURI) rep.setAttributeNS(attr.namespaceURI, attr.name, attr.value);
@@ -4627,21 +4882,21 @@ function replaceLocalName(el, qname, ownerDoc) {
 * Implementation: ensure <w:pPr><w:rPr><w:del/></w:rPr> exists.
 */
 function markParagraphMarkDeleted(p, ownerDoc, ctx) {
-	let pPr = firstChildNS(p, w$10, "pPr");
+	let pPr = firstChildNS(p, w$11, "pPr");
 	if (!pPr) {
-		pPr = ownerDoc.createElementNS(w$10, "w:pPr");
+		pPr = ownerDoc.createElementNS(w$11, "w:pPr");
 		p.insertBefore(pPr, p.firstChild);
 	}
-	let rPr = firstChildNS(pPr, w$10, "rPr");
+	let rPr = firstChildNS(pPr, w$11, "rPr");
 	if (!rPr) {
-		rPr = ownerDoc.createElementNS(w$10, "w:rPr");
+		rPr = ownerDoc.createElementNS(w$11, "w:rPr");
 		pPr.appendChild(rPr);
 	}
-	for (const c of getChildren(rPr)) if (c.namespaceURI === w$10 && c.localName === "del") return;
-	const del = ownerDoc.createElementNS(w$10, "w:del");
-	del.setAttributeNS(w$10, "w:id", String(ctx.nextId()));
-	del.setAttributeNS(w$10, "w:author", ctx.author);
-	del.setAttributeNS(w$10, "w:date", ctx.date);
+	for (const c of getChildren(rPr)) if (c.namespaceURI === w$11 && c.localName === "del") return;
+	const del = ownerDoc.createElementNS(w$11, "w:del");
+	del.setAttributeNS(w$11, "w:id", String(ctx.nextId()));
+	del.setAttributeNS(w$11, "w:author", ctx.author);
+	del.setAttributeNS(w$11, "w:date", ctx.date);
 	rPr.insertBefore(del, rPr.firstChild);
 }
 /**
@@ -4650,7 +4905,7 @@ function markParagraphMarkDeleted(p, ownerDoc, ctx) {
 * call `markParagraphMarkDeleted` separately if the whole paragraph is going.
 */
 function wrapParagraphContentInDel(p, ownerDoc, ctx) {
-	const runs = getChildrenNS(p, w$10, "r");
+	const runs = getChildrenNS(p, w$11, "r");
 	if (runs.length === 0) return;
 	const before = runs[0].previousSibling;
 	const detached = [];
@@ -4688,7 +4943,7 @@ function markParagraphAsInserted(p, ownerDoc, ctx) {
 		groupAnchor = null;
 	};
 	for (const child of orderedChildren) {
-		if (child.namespaceURI !== w$10) continue;
+		if (child.namespaceURI !== w$11) continue;
 		if (child.localName === "r") {
 			if (runGroup.length === 0) groupAnchor = child.previousSibling;
 			runGroup.push(child);
@@ -4696,7 +4951,7 @@ function markParagraphAsInserted(p, ownerDoc, ctx) {
 		}
 		if (child.localName === "hyperlink") {
 			flushRunGroup();
-			const innerRuns = getChildrenNS(child, w$10, "r");
+			const innerRuns = getChildrenNS(child, w$11, "r");
 			if (innerRuns.length === 0) continue;
 			const innerBefore = innerRuns[0].previousSibling;
 			const innerDetached = [];
@@ -4711,21 +4966,21 @@ function markParagraphAsInserted(p, ownerDoc, ctx) {
 		}
 	}
 	flushRunGroup();
-	let pPr = firstChildNS(p, w$10, "pPr");
+	let pPr = firstChildNS(p, w$11, "pPr");
 	if (!pPr) {
-		pPr = ownerDoc.createElementNS(w$10, "w:pPr");
+		pPr = ownerDoc.createElementNS(w$11, "w:pPr");
 		p.insertBefore(pPr, p.firstChild);
 	}
-	let rPr = firstChildNS(pPr, w$10, "rPr");
+	let rPr = firstChildNS(pPr, w$11, "rPr");
 	if (!rPr) {
-		rPr = ownerDoc.createElementNS(w$10, "w:rPr");
+		rPr = ownerDoc.createElementNS(w$11, "w:rPr");
 		pPr.appendChild(rPr);
 	}
-	for (const c of getChildren(rPr)) if (c.namespaceURI === w$10 && c.localName === "ins") return;
-	const insMark = ownerDoc.createElementNS(w$10, "w:ins");
-	insMark.setAttributeNS(w$10, "w:id", String(ctx.nextId()));
-	insMark.setAttributeNS(w$10, "w:author", ctx.author);
-	insMark.setAttributeNS(w$10, "w:date", ctx.date);
+	for (const c of getChildren(rPr)) if (c.namespaceURI === w$11 && c.localName === "ins") return;
+	const insMark = ownerDoc.createElementNS(w$11, "w:ins");
+	insMark.setAttributeNS(w$11, "w:id", String(ctx.nextId()));
+	insMark.setAttributeNS(w$11, "w:author", ctx.author);
+	insMark.setAttributeNS(w$11, "w:date", ctx.date);
 	rPr.insertBefore(insMark, rPr.firstChild);
 }
 /**
@@ -4736,11 +4991,11 @@ function markParagraphAsInserted(p, ownerDoc, ctx) {
 */
 function attachRPrChange(rPr, previousRPrSnapshot, ownerDoc, ctx) {
 	if (!ctx.enabled) return;
-	const change = ownerDoc.createElementNS(w$10, "w:rPrChange");
-	change.setAttributeNS(w$10, "w:id", String(ctx.nextId()));
-	change.setAttributeNS(w$10, "w:author", ctx.author);
-	change.setAttributeNS(w$10, "w:date", ctx.date);
-	const inner = previousRPrSnapshot ? previousRPrSnapshot.cloneNode(true) : ownerDoc.createElementNS(w$10, "w:rPr");
+	const change = ownerDoc.createElementNS(w$11, "w:rPrChange");
+	change.setAttributeNS(w$11, "w:id", String(ctx.nextId()));
+	change.setAttributeNS(w$11, "w:author", ctx.author);
+	change.setAttributeNS(w$11, "w:date", ctx.date);
+	const inner = previousRPrSnapshot ? previousRPrSnapshot.cloneNode(true) : ownerDoc.createElementNS(w$11, "w:rPr");
 	change.appendChild(inner);
 	rPr.appendChild(change);
 }
@@ -4752,11 +5007,11 @@ function attachRPrChange(rPr, previousRPrSnapshot, ownerDoc, ctx) {
 */
 function attachPPrChange(pPr, previousPPrSnapshot, ownerDoc, ctx) {
 	if (!ctx.enabled) return;
-	const change = ownerDoc.createElementNS(w$10, "w:pPrChange");
-	change.setAttributeNS(w$10, "w:id", String(ctx.nextId()));
-	change.setAttributeNS(w$10, "w:author", ctx.author);
-	change.setAttributeNS(w$10, "w:date", ctx.date);
-	const inner = previousPPrSnapshot ? previousPPrSnapshot.cloneNode(true) : ownerDoc.createElementNS(w$10, "w:pPr");
+	const change = ownerDoc.createElementNS(w$11, "w:pPrChange");
+	change.setAttributeNS(w$11, "w:id", String(ctx.nextId()));
+	change.setAttributeNS(w$11, "w:author", ctx.author);
+	change.setAttributeNS(w$11, "w:date", ctx.date);
+	const inner = previousPPrSnapshot ? previousPPrSnapshot.cloneNode(true) : ownerDoc.createElementNS(w$11, "w:pPr");
 	change.appendChild(inner);
 	pPr.appendChild(change);
 }
@@ -5197,7 +5452,7 @@ function mimeForExt(ext) {
 * blue + underlined convention). `ensureHyperlinkCharStyle` injects the
 * style into styles.xml on first use when it isn't already present.
 */
-const w$9 = NS.w;
+const w$10 = NS.w;
 const HYPERLINK_STYLE_ID = "Hyperlink";
 /** Parse a link string into either an internal anchor name or an external
 *  URI. Schema's refine already enforces `#`-prefix format for anchors;
@@ -5217,21 +5472,21 @@ function parseLinkTarget(link) {
 *  supplied `format` layers on top via run rPr. */
 function emitHyperlinkNode(ownerDoc, link, text, format, assetRegistry) {
 	const target = parseLinkTarget(link);
-	const hyper = ownerDoc.createElementNS(w$9, "w:hyperlink");
-	if (target.kind === "anchor") hyper.setAttributeNS(w$9, "w:anchor", target.name);
+	const hyper = ownerDoc.createElementNS(w$10, "w:hyperlink");
+	if (target.kind === "anchor") hyper.setAttributeNS(w$10, "w:anchor", target.name);
 	else {
 		const { rId } = assetRegistry.registerExternalLink(target.href);
 		hyper.setAttributeNS(NS.r, "r:id", rId);
-		hyper.setAttributeNS(w$9, "w:history", "1");
+		hyper.setAttributeNS(w$10, "w:history", "1");
 	}
-	const run = ownerDoc.createElementNS(w$9, "w:r");
-	const rPr = ownerDoc.createElementNS(w$9, "w:rPr");
-	const rStyle = ownerDoc.createElementNS(w$9, "w:rStyle");
-	rStyle.setAttributeNS(w$9, "w:val", HYPERLINK_STYLE_ID);
+	const run = ownerDoc.createElementNS(w$10, "w:r");
+	const rPr = ownerDoc.createElementNS(w$10, "w:rPr");
+	const rStyle = ownerDoc.createElementNS(w$10, "w:rStyle");
+	rStyle.setAttributeNS(w$10, "w:val", HYPERLINK_STYLE_ID);
 	rPr.appendChild(rStyle);
 	if (format) for (const c of buildRPrChildren(format, ownerDoc)) insertChildInOrder(rPr, c, RPR_CHILD_ORDER);
 	run.appendChild(rPr);
-	const t = ownerDoc.createElementNS(w$9, "w:t");
+	const t = ownerDoc.createElementNS(w$10, "w:t");
 	t.setAttribute("xml:space", "preserve");
 	t.textContent = text;
 	run.appendChild(t);
@@ -5246,32 +5501,92 @@ function emitHyperlinkNode(ownerDoc, link, text, format, assetRegistry) {
 function ensureHyperlinkCharStyle(stylesDoc) {
 	const root = stylesDoc.documentElement;
 	if (!root) return false;
-	for (const s of getChildrenNS(root, w$9, "style")) if (wAttr(s, "styleId") === HYPERLINK_STYLE_ID) return false;
-	const style = stylesDoc.createElementNS(w$9, "w:style");
-	style.setAttributeNS(w$9, "w:type", "character");
-	style.setAttributeNS(w$9, "w:styleId", HYPERLINK_STYLE_ID);
-	const name = stylesDoc.createElementNS(w$9, "w:name");
-	name.setAttributeNS(w$9, "w:val", "Hyperlink");
+	for (const s of getChildrenNS(root, w$10, "style")) if (wAttr(s, "styleId") === HYPERLINK_STYLE_ID) return false;
+	const style = stylesDoc.createElementNS(w$10, "w:style");
+	style.setAttributeNS(w$10, "w:type", "character");
+	style.setAttributeNS(w$10, "w:styleId", HYPERLINK_STYLE_ID);
+	const name = stylesDoc.createElementNS(w$10, "w:name");
+	name.setAttributeNS(w$10, "w:val", "Hyperlink");
 	style.appendChild(name);
-	const basedOn = stylesDoc.createElementNS(w$9, "w:basedOn");
-	basedOn.setAttributeNS(w$9, "w:val", "DefaultParagraphFont");
+	const basedOn = stylesDoc.createElementNS(w$10, "w:basedOn");
+	basedOn.setAttributeNS(w$10, "w:val", "DefaultParagraphFont");
 	style.appendChild(basedOn);
-	const uiPriority = stylesDoc.createElementNS(w$9, "w:uiPriority");
-	uiPriority.setAttributeNS(w$9, "w:val", "99");
+	const uiPriority = stylesDoc.createElementNS(w$10, "w:uiPriority");
+	uiPriority.setAttributeNS(w$10, "w:val", "99");
 	style.appendChild(uiPriority);
-	style.appendChild(stylesDoc.createElementNS(w$9, "w:unhideWhenUsed"));
-	const rPr = stylesDoc.createElementNS(w$9, "w:rPr");
-	const color = stylesDoc.createElementNS(w$9, "w:color");
-	color.setAttributeNS(w$9, "w:val", "0563C1");
-	color.setAttributeNS(w$9, "w:themeColor", "hyperlink");
+	style.appendChild(stylesDoc.createElementNS(w$10, "w:unhideWhenUsed"));
+	const rPr = stylesDoc.createElementNS(w$10, "w:rPr");
+	const color = stylesDoc.createElementNS(w$10, "w:color");
+	color.setAttributeNS(w$10, "w:val", "0563C1");
+	color.setAttributeNS(w$10, "w:themeColor", "hyperlink");
 	rPr.appendChild(color);
-	const u = stylesDoc.createElementNS(w$9, "w:u");
-	u.setAttributeNS(w$9, "w:val", "single");
+	const u = stylesDoc.createElementNS(w$10, "w:u");
+	u.setAttributeNS(w$10, "w:val", "single");
 	rPr.appendChild(u);
 	style.appendChild(rPr);
 	root.appendChild(style);
 	return true;
 }
+
+//#endregion
+//#region lib/edit/wid-allocator.ts
+/**
+* Shared `w:id` allocator for the document-wide ID space.
+*
+* OOXML elements that carry a `w:id` attribute share a single document-scoped
+* ID space: `<w:bookmarkStart>` / `<w:bookmarkEnd>`, `<w:ins>` / `<w:del>` /
+* `<w:moveFrom>` / `<w:moveTo>` and their range markers, `<w:commentRangeStart>` /
+* end / reference, `<w:rPrChange>` / `<w:pPrChange>` / `<w:tblPrChange>` /
+* `<w:tcPrChange>` / `<w:trPrChange>` / `<w:sectPrChange>` / `<w:numPrChange>`.
+*
+* Allocating per-subsystem from 0 collides both with source IDs already present
+* in the document and across subsystems (bookmarks vs revisions allocating the
+* same number). Route every allocation through one instance per apply so the
+* counter is monotonic and starts above every pre-existing ID.
+*
+* Scan strategy: walk every element and read the `w:id` attribute (the
+* attribute IS in the `w` namespace — `getAttributeNS(w, "id")`). Scanning
+* by attribute rather than enumerating tag names survives future OOXML
+* extensions that introduce new `w:id`-bearing elements without code changes.
+*/
+const w$9 = NS.w;
+/**
+* Two-tier `w:id` lookup. `getAttributeNS` alone is unreliable: @xmldom/xmldom
+* does not consistently namespace-resolve prefixed attributes on parsed XML,
+* so `w:id="N"` may arrive with `namespaceURI === null` and qualified name
+* `"w:id"`. The codebase-wide `wAttr` helper adds a third tier — bare
+* `getAttribute("id")` — which is correct for most `w:*` attributes but
+* **wrong here**: DrawingML wraps inside `w:drawing` carry unrelated `id`
+* attributes (`<wp:docPr id="..."/>`, `<pic:cNvPr id="..."/>`) that live in
+* a separate ID space from OOXML's `w:id`. Picking those up pollutes the
+* counter with millions and breaks deterministic emission.
+*/
+function readWId(el) {
+	const ns = el.getAttributeNS(w$9, "id");
+	if (ns !== null && ns !== "") return ns;
+	const raw = el.getAttribute("w:id");
+	return raw && raw !== "" ? raw : null;
+}
+var WIdAllocator = class {
+	nextId;
+	constructor(documentDoc) {
+		let max = -1;
+		const root = documentDoc.documentElement;
+		if (root) {
+			const all = root.getElementsByTagName("*");
+			for (let i = 0; i < all.length; i++) {
+				const idAttr = readWId(all[i]);
+				if (!idAttr) continue;
+				const n = parseInt(idAttr, 10);
+				if (Number.isFinite(n) && n > max) max = n;
+			}
+		}
+		this.nextId = max + 1;
+	}
+	next() {
+		return this.nextId++;
+	}
+};
 
 //#endregion
 //#region lib/edit/bookmark.ts
@@ -5316,7 +5631,12 @@ function ensureHyperlinkCharStyle(stylesDoc) {
 * named via anchor) get wrapped at `commit` time.
 */
 var BookmarkAllocator = class {
-	nextId;
+	/** Document-wide `w:id` allocator, shared with TrackContext when both run
+	* in the same apply so bookmark IDs and revision IDs don't collide with
+	* each other or with pre-existing IDs in the source. Constructed
+	* internally when not provided — single-purpose call sites (caption-only
+	* pipelines, ad-hoc bookmark work) don't need to coordinate. */
+	idAllocator;
 	/** Tracks every name in use across all three sources: source bookmarks
 	* (including non-paragraph-level ones not surfaced in `nameIndex`),
 	* bound records, and pending reservations. Used for collision detection
@@ -5331,19 +5651,14 @@ var BookmarkAllocator = class {
 	* check fast-paths via `isRangeBookmark` so caption-class targets
 	* don't need a numPr binding. */
 	rangeBookmarks = /* @__PURE__ */ new Set();
-	constructor(documentDoc) {
-		this.nextId = 0;
+	constructor(documentDoc, idAllocator) {
+		this.idAllocator = idAllocator ?? new WIdAllocator(documentDoc);
 		this.usedNames = /* @__PURE__ */ new Set();
 		const root = documentDoc.documentElement;
 		if (root) {
 			const starts = root.getElementsByTagNameNS(NS.w, "bookmarkStart");
 			for (let i = 0; i < starts.length; i++) {
 				const el = starts[i];
-				const idAttr = wAttr(el, "id");
-				if (idAttr) {
-					const n = parseInt(idAttr, 10);
-					if (Number.isFinite(n) && n >= this.nextId) this.nextId = n + 1;
-				}
 				const name = wAttr(el, "name");
 				if (!name) continue;
 				this.usedNames.add(name);
@@ -5362,7 +5677,7 @@ var BookmarkAllocator = class {
 	getOrAllocate(pEl) {
 		const cached = this.byElement.get(pEl);
 		if (cached) return cached;
-		const id = this.nextId++;
+		const id = this.idAllocator.next();
 		const name = this.allocName();
 		const assignment = {
 			id,
@@ -5427,7 +5742,7 @@ var BookmarkAllocator = class {
 		}
 		if (this.nameIndex.has(name)) throw new Error(`anchor "${name}" ${this.describeCollision(name)}. Pick a unique anchor name.`);
 		this.reservations.delete(name);
-		const id = this.nextId++;
+		const id = this.idAllocator.next();
 		this.usedNames.add(name);
 		const assignment = {
 			id,
@@ -5460,7 +5775,7 @@ var BookmarkAllocator = class {
 		if (this.nameIndex.has(name)) throw new Error(`anchor "${name}" ${this.describeCollision(name)}. Pick a unique anchor name.`);
 		if (this.usedNames.has(name) && !this.reservations.has(name)) throw new Error(`anchor "${name}" ${this.describeCollision(name)}. Pick a unique anchor name.`);
 		this.reservations.delete(name);
-		const id = this.nextId++;
+		const id = this.idAllocator.next();
 		this.usedNames.add(name);
 		this.rangeBookmarks.add(name);
 		return {
@@ -5723,6 +6038,7 @@ function previewEditOps(input) {
 		const op = edit.op.op;
 		let willReplaceOrDeleteIndices = [];
 		let willInsertCount = 0;
+		let survivorIndex;
 		if (op === "replace") {
 			willReplaceOrDeleteIndices = [...targetParaIndices];
 			willInsertCount = edit.op.with.length;
@@ -5730,6 +6046,16 @@ function previewEditOps(input) {
 		} else if (op === "delete") {
 			willReplaceOrDeleteIndices = [...targetParaIndices];
 			for (const idx of targetParaIndices) if (idx >= 0) replacedOrDeletedIndices.add(idx);
+		} else if (op === "merge") {
+			willReplaceOrDeleteIndices = [...targetParaIndices];
+			for (const idx of targetParaIndices) if (idx >= 0) replacedOrDeletedIndices.add(idx);
+			const keepPPr = edit.op.keepPPr ?? "first";
+			const sortedTargets = [...targetParaIndices].sort((a, b) => a - b);
+			const survivorIdx = keepPPr === "last" ? sortedTargets[sortedTargets.length - 1] : sortedTargets[0];
+			if (survivorIdx !== void 0 && survivorIdx >= 0) {
+				survivorIndex = survivorIdx;
+				replacedOrDeletedIndices.delete(survivorIdx);
+			}
 		} else if (op === "insert-before" || op === "insert-after") willInsertCount = edit.op.content.length;
 		const container = edit.target.container.namespaceURI === w$7 && edit.target.container.localName === "tc" ? "cell" : "body";
 		entries.push({
@@ -5738,7 +6064,8 @@ function previewEditOps(input) {
 			targetParaIndices,
 			willReplaceOrDeleteIndices,
 			willInsertCount,
-			container
+			container,
+			survivorIndex
 		});
 	}
 	return {
@@ -5756,7 +6083,7 @@ function previewEditOps(input) {
 * own replacement map) plus the applied-ops report.
 */
 async function runEditOps(input) {
-	const { documentDoc, parsedParagraphs, reader, edits, trackChanges, stylesDoc } = input;
+	const { documentDoc, parsedParagraphs, reader, edits, trackChanges, author, stylesDoc, numberingDoc } = input;
 	const resolverCtx = buildResolverContext(documentDoc, parsedParagraphs);
 	const blockers = detectBlockers(documentDoc, resolverCtx.indexByElement);
 	const resolved = [];
@@ -5767,6 +6094,7 @@ async function runEditOps(input) {
 	}
 	validateAgainstBlockers(resolved, blockers, resolverCtx.indexByElement);
 	if (trackChanges) for (const [i, op] of edits.entries()) {
+		if (op.op === "merge") throw new Error(`edits[${i}] (merge): merge under trackChanges=true is not supported. Run merge in a separate apply without trackChanges.`);
 		const frag = op.op === "replace" ? op.with : op.op === "insert-before" || op.op === "insert-after" ? op.content : null;
 		if (!frag) continue;
 		if (fragmentContainsTable(frag)) throw new Error(`edits[${i}] (${op.op}): inserting a TableBlock under trackChanges=true is not supported. Run table insertion in a separate apply without trackChanges, then use trackChanges for subsequent cell edits.`);
@@ -5784,10 +6112,11 @@ async function runEditOps(input) {
 			throw new Error(`edits[${i}] (${op.op}): ${err.message}`, { cause: err });
 		}
 	}
-	const trackContext = makeTrackContext(trackChanges);
+	const idAllocator = new WIdAllocator(documentDoc);
+	const trackContext = makeTrackContext(trackChanges, idAllocator, { author });
 	const stale = /* @__PURE__ */ new Set();
 	const imageRegistry = input.imageRegistry ?? await DocxAssetRegistry.open(reader);
-	const bookmarkAllocator = new BookmarkAllocator(documentDoc);
+	const bookmarkAllocator = new BookmarkAllocator(documentDoc, idAllocator);
 	for (const op of edits) {
 		const fragment = fragmentOf(op);
 		if (!fragment) continue;
@@ -5865,7 +6194,8 @@ async function runEditOps(input) {
 		},
 		adoptAnchor: (name, pEl) => {
 			bookmarkAllocator.adoptName(name, pEl);
-		}
+		},
+		forkNumRestart: numberingDoc ? (pEl, numId, level) => applyParagraphLevelRestart(pEl, numberingDoc, numId, level) : void 0
 	};
 	const perOp = [];
 	for (const [i, edit] of resolved.entries()) {
@@ -5878,7 +6208,8 @@ async function runEditOps(input) {
 		try {
 			touched = applyOne(edit, documentDoc, trackContext, perOpCtx, stale, resolverCtx, {
 				bookmarkAllocator,
-				captionsMap: input.captions
+				captionsMap: input.captions,
+				blockersByElement: blockers.byElement
 			});
 		} catch (err) {
 			const msg = err.message;
@@ -6001,12 +6332,16 @@ function usableWidthForTarget(target, sections, resolverCtx) {
 }
 function validateAgainstBlockers(resolved, blockers, indexByElement) {
 	const failures = [];
-	for (const [i, edit] of resolved.entries()) for (const p of edit.target.paragraphs) {
-		const reason = blockers.byElement.get(p);
-		if (reason) {
-			const idx = indexByElement.get(p);
-			const where = idx !== void 0 ? `paragraph #${idx}` : `cell paragraph`;
-			failures.push(`edits[${i}] (${edit.op.op}): ${where} is blocked — ${explainBlockerReason(reason)}`);
+	for (const [i, edit] of resolved.entries()) {
+		const overwriteFields = edit.op.op === "replace" && edit.op.overwriteFields === true;
+		for (const p of edit.target.paragraphs) {
+			const reason = blockers.byElement.get(p);
+			if (reason) {
+				if (overwriteFields && reason === "field") continue;
+				const idx = indexByElement.get(p);
+				const where = idx !== void 0 ? `paragraph #${idx}` : `cell paragraph`;
+				failures.push(`edits[${i}] (${edit.op.op}): ${where} is blocked — ${explainBlockerReason(reason)}`);
+			}
 		}
 	}
 	if (failures.length > 0) throw new Error(`${failures.length} edit(s) targeted blocked paragraphs:\n  ${failures.join("\n  ")}`);
@@ -6120,13 +6455,27 @@ function applyOne(edit, documentDoc, trackContext, emitCtx, stale, resolverCtx, 
 			if (!edit.runRef) throw new Error("set-run: missing resolved run reference (internal)");
 			return applySetRun(edit.runRef, edit.op, documentDoc, trackContext);
 		case "edit-caption": return applyEditCaptionOp(edit.op, documentDoc, deps);
+		case "merge": return applyMerge(edit.target, edit.op, stale, deps.blockersByElement);
 		default: return assertNever(edit.op);
 	}
 }
 function isParagraphElement(el) {
 	return el.namespaceURI === w$7 && el.localName === "p";
 }
-function inheritPPrFromAnchor(newP, anchor, ownerDoc) {
+/** pPr fields where an explicit styleId on the new Block is meant to
+* govern. When the engine inherits anchor pPr via MDF, these fields
+* are stripped so the styleId cascade reaches them. Without this strip,
+* a direct <w:outlineLvl w:val="1"/> on the anchor would override the
+* Heading 1 outline level cascaded from ProposalH1, mis-tagging the
+* new paragraph as Heading 2. */
+const STYLE_GOVERNED_PPR_FIELDS = new Set([
+	"outlineLvl",
+	"numPr",
+	"pageBreakBefore",
+	"widowControl",
+	"spacing"
+]);
+function inheritPPrFromAnchor(newP, anchor, ownerDoc, blockHasExplicitStyleId) {
 	const anchorPPr = firstChildNS(anchor, w$7, "pPr");
 	if (!anchorPPr) return;
 	let newPPr = firstChildNS(newP, w$7, "pPr");
@@ -6140,6 +6489,7 @@ function inheritPPrFromAnchor(newP, anchor, ownerDoc) {
 		if (c.namespaceURI !== w$7) continue;
 		if (c.localName === "pPrChange") continue;
 		if (c.localName === "rPr" && newHasPStyle) continue;
+		if (blockHasExplicitStyleId && STYLE_GOVERNED_PPR_FIELDS.has(c.localName)) continue;
 		const existing = existingByName.get(c.localName);
 		if (existing) mergeMissingAttrs(c, existing);
 		else toClone.push(c.cloneNode(true));
@@ -6150,6 +6500,26 @@ function inheritPPrFromAnchor(newP, anchor, ownerDoc) {
 		newP.insertBefore(newPPr, newP.firstChild);
 	}
 	for (const c of toClone) insertChildInOrder(newPPr, c, PPR_CHILD_ORDER);
+}
+/** Inherit the anchor's first non-empty run rPr into the new paragraph's
+* runs when the Block has no explicit runFormat. This implements the
+* run-side of MDF: new paragraphs adopt the anchor's typeface so they
+* blend visually into the destination context rather than falling back to
+* the docDefault font (Calibri / 宋体). Only fields not already declared
+* on the run's rPr are inherited — explicit runFormat choices always win. */
+function inheritAnchorRunRPr(newRunRPr, anchorEl, newRunHasExplicitFormat) {
+	if (newRunHasExplicitFormat) return;
+	const firstNonEmpty = getChildrenNS(anchorEl, w$7, "r").find((r) => textContent(r).trim().length > 0);
+	if (!firstNonEmpty) return;
+	const anchorRPr = firstChildNS(firstNonEmpty, w$7, "rPr");
+	if (!anchorRPr) return;
+	const existingNames = new Set(getChildren(newRunRPr).filter((c) => c.namespaceURI === w$7).map((c) => c.localName));
+	for (const child of getChildren(anchorRPr)) {
+		if (child.namespaceURI !== w$7) continue;
+		if (child.localName === "rPrChange") continue;
+		if (existingNames.has(child.localName)) continue;
+		newRunRPr.appendChild(child.cloneNode(true));
+	}
 }
 /** Copy `source`'s attributes onto `target`, leaving any attribute already
 * set on `target` untouched. Namespace-aware. */
@@ -6169,9 +6539,20 @@ function inheritFormatForNewParagraphs(newEls, newBlocks, anchor, ownerDoc) {
 	if (!anchor) return;
 	for (let i = 0; i < newEls.length; i++) {
 		const el = newEls[i];
-		if (newBlocks[i].type !== "paragraph") continue;
+		const block = newBlocks[i];
+		if (block.type !== "paragraph") continue;
 		if (!isParagraphElement(el)) continue;
-		inheritPPrFromAnchor(el, anchor, ownerDoc);
+		inheritPPrFromAnchor(el, anchor, ownerDoc, block.styleId !== void 0);
+		const blockHasExplicitRunFormat = block.runFormat !== void 0;
+		for (const r of getChildrenNS(el, w$7, "r")) {
+			const existingRPr = firstChildNS(r, w$7, "rPr");
+			if (existingRPr !== null) inheritAnchorRunRPr(existingRPr, anchor, blockHasExplicitRunFormat);
+			else if (!blockHasExplicitRunFormat) {
+				const newRPr = ownerDoc.createElementNS(w$7, "w:rPr");
+				inheritAnchorRunRPr(newRPr, anchor, false);
+				if (newRPr.childNodes.length > 0) r.insertBefore(newRPr, r.firstChild);
+			}
+		}
 	}
 }
 function applyDelete(target, documentDoc, trackContext, stale) {
@@ -6243,6 +6624,26 @@ function insertAtContainerEnd(container, newEls, resolverCtx) {
 	}
 	for (const el of newEls) container.appendChild(el);
 }
+function applyMerge(target, op, stale, blockersByElement) {
+	if (target.paragraphs.length < 2) throw new Error(`merge: needs >= 2 paragraphs, got ${target.paragraphs.length}. Use a range or cell-paragraph-range locator covering at least two paragraphs.`);
+	for (const p of target.paragraphs) {
+		const reason = blockersByElement.get(p);
+		if (reason) throw new Error(`merge: paragraph contains ${explainBlockerReason(reason)} — refusing to merge. Accept/reject existing tracked changes or resolve fields/controls before merging.`);
+	}
+	const survivor = (op.keepPPr ?? "first") === "last" ? target.paragraphs[target.paragraphs.length - 1] : target.paragraphs[0];
+	const allContent = [];
+	for (const p of target.paragraphs) for (const child of Array.from(getChildren(p))) {
+		if (child.namespaceURI === w$7 && child.localName === "pPr") continue;
+		p.removeChild(child);
+		allContent.push(child);
+	}
+	for (const node of allContent) survivor.appendChild(node);
+	for (const p of target.paragraphs) if (p !== survivor && p.parentNode) {
+		p.parentNode.removeChild(p);
+		stale.add(p);
+	}
+	return target.paragraphs.length;
+}
 function applyReplace(target, fragment, documentDoc, trackContext, emitCtx, stale) {
 	if (target.paragraphs.length === 0) throw new Error("replace op resolved to zero paragraphs — locator must select at least one");
 	const newEls = emitFragment(fragment, documentDoc, emitCtx);
@@ -6266,8 +6667,58 @@ function applyReplace(target, fragment, documentDoc, trackContext, emitCtx, stal
 	normalizeTableSequencing(parent, documentDoc);
 	return newEls.length;
 }
+/**
+* pPr child local-names that clearDirect should strip.
+* Whitelist of format-bearing children only — structural children
+* (pStyle, numPr, sectPr, pPrChange) are intentionally absent.
+*/
+const CLEAR_DIRECT_PPR_STRIP_SET = new Set([
+	"spacing",
+	"ind",
+	"jc",
+	"outlineLvl",
+	"pageBreakBefore",
+	"keepNext",
+	"keepLines",
+	"widowControl",
+	"pBdr",
+	"shd",
+	"tabs",
+	"framePr",
+	"rPr",
+	"adjustRightInd",
+	"snapToGrid",
+	"autoSpaceDE",
+	"autoSpaceDN",
+	"textAlignment",
+	"textboxTightWrap",
+	"bidi",
+	"mirrorIndents",
+	"wordWrap",
+	"kinsoku",
+	"overflowPunct",
+	"topLinePunct",
+	"contextualSpacing",
+	"divId"
+]);
 function applyFormat(target, op, documentDoc, trackContext) {
 	if (target.paragraphs.length === 0) throw new Error("format op resolved to zero paragraphs — locator must select at least one");
+	const clear = op.clearDirect;
+	const shouldClearPPr = clear === "all" || Array.isArray(clear) && clear.includes("pPr");
+	const shouldClearRPr = clear === "all" || Array.isArray(clear) && clear.includes("rPr");
+	if (shouldClearPPr || shouldClearRPr) for (const p of target.paragraphs) {
+		if (shouldClearPPr) {
+			const pPr = firstChildNS(p, w$7, "pPr");
+			if (pPr) for (const c of [...getChildren(pPr)]) {
+				if (c.namespaceURI !== w$7) continue;
+				if (CLEAR_DIRECT_PPR_STRIP_SET.has(c.localName)) pPr.removeChild(c);
+			}
+		}
+		if (shouldClearRPr) for (const r of getChildrenNS(p, w$7, "r")) {
+			const rPr = firstChildNS(r, w$7, "rPr");
+			if (rPr) r.removeChild(rPr);
+		}
+	}
 	let touched = 0;
 	for (const p of target.paragraphs) {
 		if (op.runFormat) for (const r of getChildrenNS(p, w$7, "r")) {
@@ -7246,7 +7697,8 @@ function rebuildCaptionParagraphInPlace(paragraph, config, bookmarkId, bookmarkN
 		subGroup,
 		chapterPrefixResults: seq.chapterPrefixResults,
 		parentSeqResult: seq.parentSeqResult,
-		subSeqResult: seq.subSeqResult
+		subSeqResult: seq.subSeqResult,
+		bodyText: bodyText === "" ? void 0 : bodyText
 	};
 }
 function extractCaptionParts(paragraph, identifier, bodySeparator) {
@@ -8388,6 +8840,19 @@ function applyHeaderFooterBinding(documentDoc, report) {
 
 //#endregion
 //#region lib/apply/apply-styles.ts
+/**
+* Normalize a ValidationError into a stable key for baseline comparison.
+* Strips file paths, line/column coordinates, and paragraph indices — all
+* of which differ between source and output but don't indicate a new
+* structural problem introduced by apply. Two errors that vary only in
+* position (same schema violation, different location in same part) map to
+* the same key so a pre-existing positional shift doesn't create a false
+* "new" error.
+*/
+function normalizeValidationError(e) {
+	const msg = e.message.replace(/\/[^\s"']+\.docx/g, "<docx>").replace(/\bline \d+\b/g, "line N").replace(/\bcol \d+\b/g, "col M").replace(/\bparagraph #\d+\b/g, "paragraph #N").replace(/\binput_\d+\.xml\b/g, "input_N.xml").trim();
+	return `${e.part}||${msg}`;
+}
 /** Heuristic checks on a resolved style entry. The engine doesn't reject
 * these — they're informational signals surfaced in dry-run + the change
 * report so the agent can fix before commit. Narrow by design: only fire
@@ -8478,6 +8943,14 @@ async function applyStyles(source, output, config) {
 	let fpResult = new Fingerprinter().assign(parsed.paragraphs, resolver);
 	const hashToLetter = /* @__PURE__ */ new Map();
 	for (const s of fpResult.summary) hashToLetter.set(s.hash, s.label);
+	const preTemplateSourceNumIds = /* @__PURE__ */ new Set();
+	for (const numEl of getChildrenNS(numberingDoc.documentElement, NS.w, "num")) {
+		const idStr = wAttr(numEl, "numId");
+		if (idStr) {
+			const id = parseInt(idStr, 10);
+			if (Number.isFinite(id)) preTemplateSourceNumIds.add(id);
+		}
+	}
 	let templateImport = null;
 	if (config.template) {
 		const tplCfg = config.template;
@@ -8519,8 +8992,10 @@ async function applyStyles(source, output, config) {
 		}
 	}
 	const styleNameConflicts = [];
+	const sourceStyleIds = new Set(getChildrenNS(stylesDoc.documentElement, NS.w, "style").map((s) => wAttr(s, "styleId")).filter((id) => id !== null));
 	for (const def of resolvedStyles) {
-		const key = canonicalNameKey(def.name);
+		if (def.name === void 0 && sourceStyleIds.has(def.id)) continue;
+		const key = canonicalNameKey(def.name ?? def.id);
 		const collidingId = sourceCanonicalToStyleId.get(key);
 		if (collidingId && collidingId !== def.id) {
 			const existingName = sourceCanonicalToOriginalName.get(key);
@@ -8535,8 +9010,10 @@ async function applyStyles(source, output, config) {
 		const lines = [];
 		lines.push(`${styleNameConflicts.length} style name collision(s) — Word treats matching names (and locale aliases) as the same built-in identity and would silently drop the new style's rPr at render:`);
 		for (const c of styleNameConflicts) {
-			const aliasNote = c.existingName !== c.def.name ? ` (locale alias of existing "${c.existingName}")` : "";
-			lines.push(`  styles[].id="${c.def.id}" name="${c.def.name}"${aliasNote} → already used by source styleId="${c.collidingId}"`);
+			const effectiveName = c.def.name ?? c.def.id;
+			const aliasNote = c.existingName !== effectiveName ? ` (locale alias of existing "${c.existingName}")` : "";
+			const nameDisplay = c.def.name !== void 0 ? `name="${c.def.name}"` : `name omitted (defaults to id "${c.def.id}")`;
+			lines.push(`  styles[].id="${c.def.id}" ${nameDisplay}${aliasNote} → already used by source styleId="${c.collidingId}"`);
 		}
 		lines.push("");
 		lines.push("  Resolve each by either:");
@@ -8577,6 +9054,28 @@ async function applyStyles(source, output, config) {
 			if (sid) existingStyleIds.add(sid);
 		}
 		const validNumberingTargets = new Set([...declaredIds, ...existingStyleIds]);
+		const allNumIds = /* @__PURE__ */ new Set();
+		for (const numEl of getChildrenNS(numberingDoc.documentElement, NS.w, "num")) {
+			const idStr = wAttr(numEl, "numId");
+			if (idStr) {
+				const id = parseInt(idStr, 10);
+				if (Number.isFinite(id)) allNumIds.add(id);
+			}
+		}
+		const templateImportedNumIds = new Set([...allNumIds].filter((id) => !preTemplateSourceNumIds.has(id)));
+		const claimedNumIds = new Set(allNumIds);
+		for (const [schemeIdx, scheme] of numberingSchemes.entries()) {
+			if (scheme.numId === void 0) continue;
+			const path = numberingSchemes.length === 1 ? "numbering" : `numbering[${schemeIdx}]`;
+			if (preTemplateSourceNumIds.has(scheme.numId)) throw new Error(`${path}.numId = ${scheme.numId} collides with an existing <w:num w:numId="${scheme.numId}"/> in the source. Either pin to a different numId, or remove the explicit numId to let the engine allocate (the engine will pick an id not in use).`);
+			if (templateImportedNumIds.has(scheme.numId)) throw new Error(`${path}.numId = ${scheme.numId} was just claimed by template import in this apply run. Either pin to a different numId, or remove the explicit numId to let the engine allocate (the auto-allocator already skips template-imported ids).`);
+			if (claimedNumIds.has(scheme.numId)) {
+				const prev = numberingSchemes.findIndex((s, i) => i < schemeIdx && s.numId === scheme.numId);
+				const prevPath = numberingSchemes.length === 1 ? "numbering" : `numbering[${prev}]`;
+				throw new Error(`${path}.numId ${scheme.numId} conflicts with ${prevPath}.numId ${scheme.numId} — two schemes cannot share the same numId. Set a different numId on one of them, or remove numId to let the engine allocate.`);
+			}
+			claimedNumIds.add(scheme.numId);
+		}
 		for (const [schemeIdx, scheme] of numberingSchemes.entries()) {
 			if (scheme.levels.length === 0) continue;
 			const path = numberingSchemes.length === 1 ? "numbering" : `numbering[${schemeIdx}]`;
@@ -8595,7 +9094,10 @@ async function applyStyles(source, output, config) {
 					console.error(`Warning: ${path}.levels[${i}].lvlText "${lvl.lvlText}" does not reference its own counter ${ownPlaceholder} — ${refDesc}.\n  All level-${lvl.level} items will display the same number, restarting only when a higher level changes.\n  %N is positional (1-indexed): %1 → level 0, %2 → level 1, ... — so level ${lvl.level} needs ${ownPlaceholder} to render its own counter.\n  Did you mean lvlText: "${lvl.lvlText.replace(/%\d/, ownPlaceholder)}"?`);
 				}
 			}
-			const { numId, abstractNumId } = injectNumbering(numberingDoc, scheme);
+			const { numId, abstractNumId } = injectNumbering(numberingDoc, scheme, {
+				claimedNumIds,
+				requestedNumId: scheme.numId
+			});
 			for (const lvl of scheme.levels) attachNumberingToStyle(stylesDoc, lvl.styleId, numId, lvl.level);
 			installedSchemes.push({
 				levels: scheme.levels.map((l) => ({
@@ -8604,7 +9106,8 @@ async function applyStyles(source, output, config) {
 					restart: l.restart ?? "continuous"
 				})),
 				numId,
-				abstractNumId
+				abstractNumId,
+				numIdExplicit: scheme.numId !== void 0
 			});
 		}
 	}
@@ -8639,10 +9142,12 @@ async function applyStyles(source, output, config) {
 			reader,
 			edits: config.edits,
 			trackChanges: config.trackChanges ?? false,
+			author: config.author,
 			stylesDoc,
 			sections: parsed.sections,
 			captions: resolvedCaptions.byIdentifier,
-			imageRegistry: bodyAssetRegistry
+			imageRegistry: bodyAssetRegistry,
+			numberingDoc
 		});
 		editsApplied = result.report.applied;
 		editsTrackChanges = result.report.trackChanges;
@@ -8665,7 +9170,7 @@ async function applyStyles(source, output, config) {
 		if (validIndices.has(idx)) return;
 		const max = parsed.paragraphs.length;
 		const range = max > 0 ? `#${parsed.paragraphs[0].index}–#${parsed.paragraphs[max - 1].index}` : "(none)";
-		throw new Error(`${where}: paragraph #${idx} not found. Document has ${max} indexed paragraphs (${range}). Paragraphs inside data/form tables are not indexed.`);
+		throw new Error(`${where}: paragraph #${idx} not found. Document has ${max} indexed paragraphs (${range}). Paragraphs inside data tables are not indexed.`);
 	};
 	const excludeSet = new Set(config.exclude ?? []);
 	for (const idx of excludeSet) checkParaIndex(idx, `exclude`);
@@ -8747,7 +9252,7 @@ async function applyStyles(source, output, config) {
 	};
 	applyToBody(documentDoc, ctx);
 	if (installedSchemes.length > 0 && !listRestartApplied) {
-		applyListRestartPass(documentDoc, numberingDoc, installedSchemes);
+		applyListRestartPass(documentDoc, numberingDoc, installedSchemes, buildHeadingStyleIdSet(stylesDoc));
 		listRestartApplied = true;
 	}
 	let captionsPreview = null;
@@ -8774,11 +9279,16 @@ async function applyStyles(source, output, config) {
 			const previewSamples = [];
 			for (const fill of allCaptionFills) {
 				if (previewSamples.length >= 5) break;
-				const text = captionSimOutput.fullCaptionText.get(fill.paragraph);
-				if (text !== void 0) previewSamples.push({
-					identifier: fill.identifier,
-					text
-				});
+				const counterText = captionSimOutput.fullCaptionText.get(fill.paragraph);
+				if (counterText !== void 0) {
+					const captionConfig = resolvedCaptions.byIdentifier.get(fill.identifier);
+					const body = fill.bodyText;
+					const text = body !== void 0 && captionConfig !== void 0 ? counterText + captionConfig.bodySeparator + body : counterText;
+					previewSamples.push({
+						identifier: fill.identifier,
+						text
+					});
+				}
 			}
 			captionsPreview = {
 				chapterSeqsInjected,
@@ -8840,16 +9350,37 @@ async function applyStyles(source, output, config) {
 	bodyAssetRegistry.flushTo(replacements);
 	bodyAssetRegistry.getContentTypes().flushTo(replacements);
 	if (!config.dryRun) {
+		const baselineErrors = await validateDocxFile(source);
+		const baselineCounts = /* @__PURE__ */ new Map();
+		for (const e of baselineErrors) {
+			const k = normalizeValidationError(e);
+			baselineCounts.set(k, (baselineCounts.get(k) ?? 0) + 1);
+		}
 		await reader.copyAndModify(output, replacements);
-		const errors = await validateDocxFile(output);
-		if (errors.length > 0) {
-			if (existsSync(output)) try {
-				unlinkSync(output);
-			} catch {}
-			const lines = errors.slice(0, 20).map((e) => `  ${e.part}: ${e.message}`);
-			const more = errors.length > 20 ? `\n  …${errors.length - 20} more` : "";
-			console.error(`Validation FAILED:\n${lines.join("\n")}${more}`);
-			process.exit(1);
+		const outputErrors = await validateDocxFile(output);
+		const available = new Map(baselineCounts);
+		const newErrors = [];
+		const preExistingErrors = [];
+		for (const e of outputErrors) {
+			const k = normalizeValidationError(e);
+			const n = available.get(k) ?? 0;
+			if (n > 0) {
+				available.set(k, n - 1);
+				preExistingErrors.push(e);
+			} else newErrors.push(e);
+		}
+		if (preExistingErrors.length > 0) console.error(`Validation: ${preExistingErrors.length} pre-existing error(s) carried through from source (non-fatal).`);
+		if (newErrors.length > 0) {
+			const lines = newErrors.slice(0, 20).map((e) => `  ${e.part}: ${e.message}`);
+			const more = newErrors.length > 20 ? `\n  …${newErrors.length - 20} more` : "";
+			if (config.allowValidationWarnings) console.error(`Validation: ${newErrors.length} new error(s) introduced by this run (--allow-validation-warnings set; output kept):\n${lines.join("\n")}${more}`);
+			else {
+				if (existsSync(output)) try {
+					unlinkSync(output);
+				} catch {}
+				console.error(`Validation FAILED — ${newErrors.length} new error(s) introduced by this run:\n${lines.join("\n")}${more}\n  (Use --allow-validation-warnings to keep the output despite new errors.)`);
+				process.exit(1);
+			}
 		}
 	}
 	const numberingBindings = (() => {
@@ -8892,13 +9423,19 @@ async function applyStyles(source, output, config) {
 		manualNumberingDetected,
 		excludeSamples,
 		numberingBindings,
+		numberingAllocation: installedSchemes.map((s, i) => ({
+			schemeIndex: i,
+			numId: s.numId,
+			explicit: s.numIdExplicit
+		})),
 		templateImport,
 		editsPreview,
 		captionsPreview,
 		panguWarnings: panguWarnings.length > 0 ? panguWarnings : void 0,
 		pageSetup: pageSetupReport,
 		headerFooter: headerFooterReport,
-		headerFooterBinding: headerFooterBindingReport
+		headerFooterBinding: headerFooterBindingReport,
+		totalParagraphs: config.dryRun ? parsed.paragraphs[parsed.paragraphs.length - 1]?.index ?? parsed.paragraphs.length : void 0
 	});
 	if (editsApplied > 0 && !config.dryRun) console.error(`\nEdit pass: ${editsApplied} op(s) applied${editsTrackChanges ? " (track-changes)" : ""}. New paragraphs participated in pattern_rules / bulk_rules cleanup uniformly with the original chrome.`);
 }
@@ -10831,20 +11368,39 @@ const InlineStyleRefSchema = strictObject({
 	numberOnly: optional(boolean()),
 	format: optional(RunFormatSchema)
 });
+/** Inline break — emits `<w:r><w:br/></w:r>` (line) or `<w:r><w:br
+*  w:type="page|column"/></w:r>`. "line" is a soft line break within the
+*  paragraph; "page" / "column" force the next run onto the next page or
+*  column. Use sparingly — prefer paragraph-level structure over inline
+*  breaks where semantics allow. */
+const InlineBreakSchema = strictObject({ break: union([
+	literal("line"),
+	literal("page"),
+	literal("column")
+]) });
 const InlineNodeSchema = union([
 	InlineRunSchema,
 	InlineRefSchema,
 	InlineEquationSchema,
 	InlineHyperlinkSchema,
 	InlineFieldSchema,
-	InlineStyleRefSchema
+	InlineStyleRefSchema,
+	InlineBreakSchema
 ]);
 /** Plain string is shorthand for a single run with no inline formatting.
 * The emitter expands strings on the fly — most paragraphs are plain text. */
 const RichTextSchema = union([string(), array(InlineNodeSchema)]);
 const NumberingRefSchema = strictObject({
 	numId: NonEmptyString,
-	level: number().check(_gte(0), _lte(8))
+	level: number().check(_gte(0), _lte(8)),
+	/** Force a counter restart at this paragraph. The engine forks a fresh
+	* `<w:num>` pointing to the same abstractNumId with
+	* `<w:startOverride val="1"/>` so this item and subsequent items on the
+	* same scheme display 1, 2, 3 … from here. Use for mid-list resets that
+	* scheme-level `restart` can't express (e.g. the second list inside a
+	* section that already has `restart: "byHeading"` but needs a manual reset
+	* at a non-heading boundary). */
+	restart: optional(boolean())
 });
 const ParagraphBlockSchema = strictObject({
 	type: literal("paragraph"),
@@ -11120,8 +11676,15 @@ const CellLocatorSchema = strictObject({
 	type: literal("cell"),
 	table: number().check(_gte(1)),
 	row: number().check(_gte(1)),
-	col: number().check(_gte(1))
-});
+	col: number().check(_gte(1)),
+	/** 1-based paragraph index WITHIN this cell. When set, the locator
+	* resolves to just that one paragraph instead of all paragraphs in
+	* the cell. Pair with `to` for a contiguous range within the cell. */
+	paragraph: optional(number().check(_gte(1))),
+	/** 1-based "to" paragraph index within the cell, inclusive. Only
+	* meaningful with `paragraph`; defines a range [paragraph, to]. */
+	to: optional(number().check(_gte(1)))
+}).check(refine((loc) => !(loc.to !== void 0 && loc.paragraph === void 0), { error: "cell locator: `to` requires `paragraph` to be set" })).check(refine((loc) => loc.to === void 0 || loc.paragraph === void 0 || loc.to >= loc.paragraph, { error: "cell locator: `to` must be >= `paragraph`" }));
 const HeadingLocatorSchema = strictObject({
 	type: literal("heading"),
 	text: NonEmptyString,
@@ -11133,13 +11696,30 @@ const WholeBodyLocatorSchema = strictObject({ type: literal("whole-body") });
 * surrounding label runs. Pick the run by 1-based `runIndex`, or by `blank`
 * (Kth run whose text is whitespace-only and rPr carries `<w:u/>` — typical
 * form-fill placeholder). When both omitted, defaults to the first blank
-* run (`blank: 1`). */
-const RunLocatorSchema = strictObject({
+* run (`blank: 1`).
+*
+* Two forms:
+*   Global: `{ type: "run", paragraph: N, blank?, runIndex? }` — targets
+*     paragraph N in the indexed (body + layout-table-cell) scope.
+*   Cell:   `{ type: "run", table: T, row: R, col: C, paragraph: K, blank?,
+*              runIndex? }` — targets paragraph K inside data-table cell
+*     (T, R, C). Mirrors the `cell` locator coordinate scheme. */
+const RunLocatorGlobalSchema = strictObject({
 	type: literal("run"),
 	paragraph: number().check(_gte(1)),
 	blank: optional(number().check(_gte(1))),
 	runIndex: optional(number().check(_gte(1)))
-}).check(refine((loc) => !(loc.blank !== void 0 && loc.runIndex !== void 0), { error: "run locator: pass either `blank` or `runIndex`, not both" }));
+});
+const RunLocatorCellSchema = strictObject({
+	type: literal("run"),
+	table: number().check(_gte(1)),
+	row: number().check(_gte(1)),
+	col: number().check(_gte(1)),
+	paragraph: number().check(_gte(1)),
+	blank: optional(number().check(_gte(1))),
+	runIndex: optional(number().check(_gte(1)))
+});
+const RunLocatorSchema = union([RunLocatorGlobalSchema, RunLocatorCellSchema]).check(refine((loc) => !(loc.blank !== void 0 && loc.runIndex !== void 0), { error: "run locator: pass either `blank` or `runIndex`, not both" }));
 const LocatorSchema = union([
 	ParagraphLocatorSchema,
 	RangeLocatorSchema,
@@ -11150,7 +11730,13 @@ const LocatorSchema = union([
 const ReplaceOpSchema = strictObject({
 	op: literal("replace"),
 	at: LocatorSchema,
-	with: FragmentSchema
+	with: FragmentSchema,
+	/** When true, allow replacing paragraphs that contain SEQ / REF /
+	* other complex fields. Default false (blocker rejects them). Use
+	* for caption / cross-ref iteration: a previous apply emitted SEQ
+	* fields, you want to rebuild the cell content. Revisions
+	* (<w:ins> / <w:del>) and SDT controls are still blocking. */
+	overwriteFields: optional(boolean())
 });
 const InsertBeforeOpSchema = strictObject({
 	op: literal("insert-before"),
@@ -11171,8 +11757,9 @@ const FormatOpSchema = strictObject({
 	at: LocatorSchema,
 	styleId: optional(NonEmptyString),
 	runFormat: optional(RunFormatSchema),
-	paraFormat: optional(ParagraphFormatSchema)
-}).check(refine((op) => !!(op.styleId || op.runFormat || op.paraFormat), { error: "format op needs at least one of: styleId, runFormat, paraFormat" }));
+	paraFormat: optional(ParagraphFormatSchema),
+	clearDirect: optional(union([array(union([literal("pPr"), literal("rPr")])), literal("all")]))
+}).check(refine((op) => !!(op.styleId || op.runFormat || op.paraFormat || op.clearDirect), { error: "format op needs at least one of: styleId, runFormat, paraFormat, clearDirect" }));
 const SetRunOpSchema = strictObject({
 	op: literal("set-run"),
 	at: RunLocatorSchema,
@@ -11195,6 +11782,12 @@ const EditCaptionOpSchema = strictObject({
 	target: EditCaptionTargetSchema,
 	text: string()
 });
+const MergeOpSchema = strictObject({
+	op: literal("merge"),
+	at: LocatorSchema,
+	/** Keep the pPr of which paragraph: "first" (default) or "last". */
+	keepPPr: optional(union([literal("first"), literal("last")]))
+});
 const EditOpSchema = discriminatedUnion("op", [
 	ReplaceOpSchema,
 	InsertBeforeOpSchema,
@@ -11202,14 +11795,19 @@ const EditOpSchema = discriminatedUnion("op", [
 	DeleteOpSchema,
 	FormatOpSchema,
 	SetRunOpSchema,
-	EditCaptionOpSchema
+	EditCaptionOpSchema,
+	MergeOpSchema
 ]);
 const EditConfigSchema = strictObject({
 	source: NonEmptyString,
 	output: NonEmptyString,
 	edits: array(EditOpSchema).check(_minLength(1)),
-	trackChanges: optional(boolean())
-});
+	trackChanges: optional(boolean()),
+	/** See ApplyConfigSchema.author — same semantics: written to revision
+	* markup's `w:author` attribute when trackChanges is on; omitted means
+	* Word shows "Unknown Author". Never defaulted to a tool brand. */
+	author: optional(NonEmptyString)
+}).check(refine((cfg) => !(cfg.author !== void 0 && cfg.author.trim() === ""), { error: "author: must be non-empty / non-whitespace when set. To leave revisions unattributed, omit the field entirely (Word will display 'Unknown Author')." }), refine((cfg) => !(cfg.author !== void 0 && cfg.trackChanges !== true), { error: "author: only meaningful when `trackChanges: true`. Either enable trackChanges or remove the author field." }));
 
 //#endregion
 //#region lib/config/config-schema.ts
@@ -11272,7 +11870,7 @@ const styleFormatFields = {
 const StyleOverridesSchema = strictObject(styleFormatFields);
 const StyleEntrySchema = strictObject({
 	id: NonEmptyString,
-	name: NonEmptyString,
+	name: optional(NonEmptyString),
 	fromParagraph: optional(number()),
 	...styleFormatFields,
 	overrides: optional(StyleOverridesSchema)
@@ -11299,7 +11897,11 @@ const NumLevelSchema = strictObject({
 	])),
 	numRPr: optional(NumRPrSchema),
 	isLgl: optional(boolean()),
-	restart: optional(_enum(["continuous", "perInstance"]))
+	restart: optional(union([_enum([
+		"continuous",
+		"perInstance",
+		"byHeading"
+	]), strictObject({ atStyleChange: NonEmptyString })]))
 }).check(refine((lvl) => {
 	const counts = (lvl.stripPrefixPatterns ?? []).map((p) => (p.match(/%\d/g) ?? []).length);
 	for (let j = 1; j < counts.length; j++) if (counts[j] > counts[j - 1]) return false;
@@ -11310,7 +11912,14 @@ const NumLevelSchema = strictObject({
 	for (let j = 1; j < counts.length; j++) if (counts[j] > counts[j - 1]) return `stripPrefixPatterns must be ordered by descending placeholder count — "${patterns[j - 1]}" (${counts[j - 1]} placeholders) before "${patterns[j]}" (${counts[j]} placeholders) means the shorter pattern matches first and strips a prefix the longer one wanted. Reorder so longer patterns come first, e.g. ["%1.%2", "%1."].`;
 	return "stripPrefixPatterns ordering invalid";
 } }));
-const NumberingSchema = strictObject({ levels: array(NumLevelSchema).check(_minLength(1)) });
+const NumberingSchema = strictObject({
+	/** Optional explicit numId. When set, the engine pins this scheme to that
+	* id (clones / creates as needed). Use to make block-level
+	* `numbering: { numId: K }` references resolve deterministically.
+	* Two schemes requesting the same numId cause apply to throw. */
+	numId: optional(number().check(_gte(1))),
+	levels: array(NumLevelSchema).check(_minLength(1))
+});
 /** Numeric format for SEQ counters. Maps to Word's `\*` switches —
 * see lib/edit/fields/seq-field.ts. */
 const CaptionFormatSchema = _enum([
@@ -11574,6 +12183,7 @@ const ApplyConfigSchema = strictObject({
 	source: optional(NonEmptyString),
 	output: NonEmptyString,
 	dryRun: optional(boolean()),
+	allowValidationWarnings: optional(boolean()),
 	template: optional(TemplateSchema),
 	theme: optional(ThemeSchema),
 	pageSetup: optional(PageSetupSchema),
@@ -11587,8 +12197,14 @@ const ApplyConfigSchema = strictObject({
 	requirements: optional(record(string(), string())),
 	exclude: optional(array(number())),
 	edits: optional(array(EditOpSchema)),
-	trackChanges: optional(boolean())
-}).check(refine((cfg) => !(cfg.template !== void 0 && cfg.source === void 0), { error: "template: incompatible with blank-source mode (omitted `source`). Blank-source starts a clean document; template-import is a delta operation that transplants styles into an existing host with its own style cascade — combining them is conceptually inconsistent. Declare `source` when you want template-import, or drop `template` to use blank-source without the transplant." }));
+	trackChanges: optional(boolean()),
+	/** Author name written to `<w:ins>` / `<w:del>` / `<w:rPrChange>` /
+	* `<w:pPrChange>`'s `w:author` attribute when `trackChanges: true`.
+	* No default — when omitted, an empty string is written (Word displays
+	* "Unknown Author"). Set to claim authorship for review handoff;
+	* never defaulted to a tool brand. */
+	author: optional(NonEmptyString)
+}).check(refine((cfg) => !(cfg.template !== void 0 && cfg.source === void 0), { error: "template: incompatible with blank-source mode (omitted `source`). Blank-source starts a clean document; template-import is a delta operation that transplants styles into an existing host with its own style cascade — combining them is conceptually inconsistent. Declare `source` when you want template-import, or drop `template` to use blank-source without the transplant." }), refine((cfg) => !(cfg.author !== void 0 && cfg.author.trim() === ""), { error: "author: must be non-empty / non-whitespace when set. To leave revisions unattributed, omit the field entirely (Word will display 'Unknown Author')." }), refine((cfg) => !(cfg.author !== void 0 && cfg.trackChanges !== true), { error: "author: only meaningful when `trackChanges: true`. Either enable trackChanges or remove the author field." }));
 /** Domain-specific hints that override or augment zod's default message for
 * particular issue shapes. Returning null means "use the default zod
 * message". The hints replicate the agent-friendly guidance the hand-written
@@ -11633,9 +12249,10 @@ function parseConfig(raw) {
 async function runCli(spec) {
 	const args = process.argv.slice(2);
 	const dryRun = args.includes("--dry-run");
+	const allowValidationWarnings = args.includes("--allow-validation-warnings");
 	const configPath = args.filter((a) => !a.startsWith("--"))[0];
 	if (!configPath) {
-		console.error(`Usage: node scripts/${spec.script} [--dry-run] <config.json>`);
+		console.error(`Usage: node scripts/${spec.script} [--dry-run] [--allow-validation-warnings] <config.json>`);
 		process.exit(1);
 	}
 	let raw;
@@ -11645,7 +12262,11 @@ async function runCli(spec) {
 		console.error(`Cannot read config: ${err.message}`);
 		process.exit(1);
 	}
-	if (dryRun && raw && typeof raw === "object") raw.dryRun = true;
+	if (raw && typeof raw === "object") {
+		const rawObj = raw;
+		if (dryRun) rawObj.dryRun = true;
+		if (allowValidationWarnings) rawObj.allowValidationWarnings = true;
+	}
 	let config;
 	try {
 		config = parseConfig(raw);

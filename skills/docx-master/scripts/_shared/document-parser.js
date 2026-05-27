@@ -568,7 +568,8 @@ var DocumentParser = class {
 						classification: "layout",
 						rows: summary.rows,
 						cols: summary.cols,
-						headers: summary.headers,
+						row1Texts: summary.row1Texts,
+						classificationReason: summary.classificationReason,
 						sectionIndex: this.currentSection,
 						innerParagraphs: innerParas
 					});
@@ -578,7 +579,8 @@ var DocumentParser = class {
 					classification: summary.classification,
 					rows: summary.rows,
 					cols: summary.cols,
-					headers: summary.headers,
+					row1Texts: summary.row1Texts,
+					classificationReason: summary.classificationReason,
 					sectionIndex: this.currentSection
 				});
 			} else if (child.localName === "sectPr") {
@@ -625,7 +627,8 @@ var DocumentParser = class {
 						classification: "layout",
 						rows: summary.rows,
 						cols: summary.cols,
-						headers: summary.headers,
+						row1Texts: summary.row1Texts,
+						classificationReason: summary.classificationReason,
 						sectionIndex: this.currentSection,
 						innerParagraphs: innerParas
 					});
@@ -635,7 +638,8 @@ var DocumentParser = class {
 					classification: summary.classification,
 					rows: summary.rows,
 					cols: summary.cols,
-					headers: summary.headers,
+					row1Texts: summary.row1Texts,
+					classificationReason: summary.classificationReason,
 					sectionIndex: this.currentSection
 				});
 			}
@@ -900,7 +904,8 @@ var DocumentParser = class {
 				classification: it.classification,
 				rows: it.rows,
 				cols: it.cols,
-				headers: it.headers,
+				row1Texts: it.row1Texts,
+				classificationReason: it.classificationReason,
 				sectionIndex: it.sectionIndex,
 				paragraphs: it.innerParagraphs ?? []
 			});

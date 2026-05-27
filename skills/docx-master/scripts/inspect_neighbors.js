@@ -63,7 +63,7 @@ async function main() {
 			const range = max > 0 ? `#${paragraphs[0].index}–#${paragraphs[max - 1].index}` : "(none)";
 			const closest = paragraphs.reduce((best, p) => Math.abs(p.index - targetIdx) < Math.abs(best.index - targetIdx) ? p : best, paragraphs[0]);
 			console.error(`Paragraph #${targetIdx} not found. Document has ${max} indexed paragraphs (${range}). Closest: #${closest.index}.`);
-			console.error("Note: paragraphs inside data/form tables are not indexed and cannot be referenced.");
+			console.error("Note: paragraphs inside data tables are not indexed and cannot be referenced.");
 			process.exit(1);
 		}
 		console.log(renderReport(doc, paraInList, radius));

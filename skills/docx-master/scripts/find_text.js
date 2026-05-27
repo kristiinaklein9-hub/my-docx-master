@@ -1,4 +1,5 @@
-import { a as firstChildNS, f as wAttr, h as NS, o as getChildren } from "./_shared/xml-utils.js";
+import { a as firstChildNS, f as wAttr, h as NS, o as getChildren, s as getChildrenNS } from "./_shared/xml-utils.js";
+import { t as summarizeTable } from "./_shared/table-classifier.js";
 import { t as loadDocx } from "./_shared/load.js";
 import { s as walkIndexedParagraphs } from "./_shared/locator.js";
 import { r as pad } from "./_shared/format.js";
@@ -49,42 +50,89 @@ function searchDocument(documentDoc, opts) {
 		if (proj.text.length === 0) continue;
 		const matches = findInProjection(proj.text, opts.pattern, re);
 		for (const m of matches) {
-			const slice = proj.text.slice(m.start, m.start + m.length);
-			if (slice.includes(TAB_SENTINEL) || slice.includes(BREAK_SENTINEL)) continue;
-			const overlapping = proj.segments.filter((seg) => seg.start < m.start + m.length && seg.end > m.start);
-			if (overlapping.length === 0) continue;
-			let firstRunIdx = null;
-			let lastRunIdx = null;
-			let region = null;
-			for (const seg of overlapping) {
-				if (seg.runIndex !== null) {
-					if (firstRunIdx === null) firstRunIdx = seg.runIndex;
-					lastRunIdx = seg.runIndex;
-				}
-				if (region === null && seg.region !== null) region = seg.region;
-			}
-			const crossRun = firstRunIdx !== null && lastRunIdx !== null && firstRunIdx !== lastRunIdx;
-			const matched = slice;
-			const beforeRaw = proj.text.slice(Math.max(0, m.start - ctxN), m.start);
-			const afterRaw = proj.text.slice(m.start + m.length, m.start + m.length + ctxN);
-			const before = beforeRaw.replace(/[\t\n￼]/g, " ");
-			const after = afterRaw.replace(/[\t\n￼]/g, " ");
-			const context = `${m.start > ctxN ? "..." : ""}${before}${bL}${matched}${bR}${after}${m.start + m.length + ctxN < proj.text.length ? "..." : ""}`;
+			const hit = buildHit(proj, m, fieldState, ctxN, bL, bR);
+			if (!hit) continue;
 			hits.push({
 				paragraphIndex: p.index,
-				ch: m.start,
-				len: m.length,
-				matched,
-				runIndex: firstRunIdx,
-				runIndexEnd: lastRunIdx,
-				crossRun,
-				region,
-				context
+				...hit
 			});
 			if (hits.length >= limit) return hits;
 		}
 	}
+	if (opts.paraIndex === void 0 && !opts.paraRange) {
+		const root = documentDoc.documentElement;
+		const body = root ? firstChildNS(root, NS.w, "body") : null;
+		if (body) {
+			let tableIdx = 0;
+			for (const child of getChildren(body)) {
+				if (child.namespaceURI !== NS.w || child.localName !== "tbl") continue;
+				tableIdx++;
+				if (summarizeTable(child).classification !== "data") continue;
+				const rows = getChildrenNS(child, NS.w, "tr");
+				for (let ri = 0; ri < rows.length; ri++) {
+					const cells = getChildrenNS(rows[ri], NS.w, "tc");
+					for (let ci = 0; ci < cells.length; ci++) {
+						const cellParas = getChildrenNS(cells[ci], NS.w, "p");
+						for (let pi = 0; pi < cellParas.length; pi++) {
+							const proj = buildParagraphProjection(cellParas[pi], fieldState);
+							if (proj.text.length === 0) continue;
+							const matches = findInProjection(proj.text, opts.pattern, re);
+							for (const m of matches) {
+								const hit = buildHit(proj, m, fieldState, ctxN, bL, bR);
+								if (!hit) continue;
+								hits.push({
+									cell: {
+										table: tableIdx,
+										row: ri + 1,
+										col: ci + 1,
+										paragraph: pi + 1
+									},
+									...hit
+								});
+								if (hits.length >= limit) return hits;
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 	return hits;
+}
+/** Build the common match-hit fields from a projection + raw match position.
+* Returns null if the match crosses a sentinel boundary. */
+function buildHit(proj, m, _fieldState, ctxN, bL, bR) {
+	const slice = proj.text.slice(m.start, m.start + m.length);
+	if (slice.includes(TAB_SENTINEL) || slice.includes(BREAK_SENTINEL)) return null;
+	const overlapping = proj.segments.filter((seg) => seg.start < m.start + m.length && seg.end > m.start);
+	if (overlapping.length === 0) return null;
+	let firstRunIdx = null;
+	let lastRunIdx = null;
+	let region = null;
+	for (const seg of overlapping) {
+		if (seg.runIndex !== null) {
+			if (firstRunIdx === null) firstRunIdx = seg.runIndex;
+			lastRunIdx = seg.runIndex;
+		}
+		if (region === null && seg.region !== null) region = seg.region;
+	}
+	const crossRun = firstRunIdx !== null && lastRunIdx !== null && firstRunIdx !== lastRunIdx;
+	const matched = slice;
+	const beforeRaw = proj.text.slice(Math.max(0, m.start - ctxN), m.start);
+	const afterRaw = proj.text.slice(m.start + m.length, m.start + m.length + ctxN);
+	const before = beforeRaw.replace(/[\t\n￼]/g, " ");
+	const after = afterRaw.replace(/[\t\n￼]/g, " ");
+	const context = `${m.start > ctxN ? "..." : ""}${before}${bL}${matched}${bR}${after}${m.start + m.length + ctxN < proj.text.length ? "..." : ""}`;
+	return {
+		ch: m.start,
+		len: m.length,
+		matched,
+		runIndex: firstRunIdx,
+		runIndexEnd: lastRunIdx,
+		crossRun,
+		region,
+		context
+	};
 }
 function buildParagraphProjection(pEl, fieldState) {
 	const segments = [];
@@ -199,6 +247,11 @@ function describeRegion(region) {
 * does next (replace via set-run, deeper inspection, coverage validation,
 * just browsing) is up to them.
 */
+/** Unique location key for grouping hits by paragraph/cell in the summary. */
+function locationKey(h) {
+	if (h.cell) return `T${h.cell.table}R${h.cell.row}C${h.cell.col}K${h.cell.paragraph}`;
+	return `#${h.paragraphIndex}`;
+}
 async function main() {
 	const argv = process.argv.slice(2);
 	let isRegex = false;
@@ -277,9 +330,9 @@ async function main() {
 			console.log(lines.join("\n"));
 			return;
 		}
-		const paraSet = new Set(hits.map((h) => h.paragraphIndex));
+		const locSet = new Set(hits.map(locationKey));
 		const annotation = formatAnnotations(summarize(hits));
-		lines.push(`${hits.length} matches across ${paraSet.size} paragraphs${annotation ? ` (${annotation})` : ""}:`);
+		lines.push(`${hits.length} matches across ${locSet.size} paragraphs${annotation ? ` (${annotation})` : ""}:`);
 		lines.push("");
 		for (const h of hits) lines.push(formatMatchLine(h));
 		if (limit !== 0 && hits.length === limit) {
@@ -293,6 +346,7 @@ async function main() {
 	}
 }
 function formatMatchLine(h) {
+	const locCol = formatLocColumn(h);
 	const runCol = formatRunColumn(h);
 	const ch = `ch=${String(h.ch).padStart(3, " ")}`;
 	const len = `len=${h.len}`;
@@ -300,7 +354,15 @@ function formatMatchLine(h) {
 	if (h.crossRun) tags.push("cross-run");
 	if (h.region) tags.push(describeRegion(h.region));
 	const tagStr = tags.length > 0 ? `   (${tags.join("; ")})` : "";
-	return `  #${pad(h.paragraphIndex)}  ${runCol}  ${ch}  ${len}   ${h.context}${tagStr}`;
+	return `  ${locCol}  ${runCol}  ${ch}  ${len}   ${h.context}${tagStr}`;
+}
+function formatLocColumn(h) {
+	const PAD = 14;
+	if (h.cell) {
+		const { table, row, col, paragraph } = h.cell;
+		return `T${table}R${row}C${col} K${paragraph}`.padEnd(PAD, " ");
+	}
+	return `#${pad(h.paragraphIndex)}`.padEnd(PAD, " ");
 }
 function formatRunColumn(h) {
 	const PAD = 12;

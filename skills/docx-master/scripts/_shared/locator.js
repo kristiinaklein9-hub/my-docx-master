@@ -2,13 +2,12 @@ import { a as firstChildNS, d as textContent, h as NS, l as paragraphStyleId$1, 
 import { t as summarizeTable } from "./table-classifier.js";
 
 //#region lib/config/edit-types.ts
-function makeTrackContext(enabled, isoDate) {
-	let counter = 0;
+function makeTrackContext(enabled, idAllocator, options) {
 	return {
 		enabled,
-		nextId: () => ++counter,
-		author: "",
-		date: isoDate ?? (/* @__PURE__ */ new Date()).toISOString().replace(/\.\d{3}Z$/, "Z")
+		nextId: () => idAllocator.next(),
+		author: options?.author ?? "",
+		date: options?.isoDate ?? (/* @__PURE__ */ new Date()).toISOString().replace(/\.\d{3}Z$/, "Z")
 	};
 }
 /**
@@ -24,7 +23,7 @@ function assertNever(x) {
 //#endregion
 //#region lib/edit/locator.ts
 /** Walk the document in DocumentParser order and return every indexed
-* paragraph with its element + container. Skips paragraphs inside data/form
+* paragraph with its element + container. Skips paragraphs inside data
 * tables (they're unindexed; reachable only via cell locator). Also skips
 * engine-managed scaffolding paragraphs — those carry a styleId starting
 * with `_` (currently `_HiddenChapterCounter`, holds the hidden chapter
@@ -91,7 +90,7 @@ function resolveLocator(loc, ctx) {
 	switch (loc.type) {
 		case "paragraph": return resolveParagraph(loc.index, ctx);
 		case "range": return resolveRange(loc.from, loc.to, ctx);
-		case "cell": return resolveCell(loc.table, loc.row, loc.col, ctx);
+		case "cell": return resolveCell(loc.table, loc.row, loc.col, loc.paragraph, loc.to, ctx);
 		case "heading": return resolveHeading(loc.text, loc.level, ctx);
 		case "whole-body": return resolveWholeBody(ctx);
 		default: return assertNever(loc);
@@ -101,7 +100,7 @@ function resolveParagraph(index, ctx) {
 	const hit = ctx.indexed[index - 1];
 	if (!hit || hit.index !== index) {
 		const max = ctx.indexed.length;
-		throw new Error(`paragraph #${index} not found. Document has ${max} indexed paragraph(s) (range: #1${max ? `–#${max}` : ""}). Paragraphs inside data/form tables are unindexed and only reachable via a cell locator.`);
+		throw new Error(`paragraph #${index} not found. Document has ${max} indexed paragraph(s) (range: #1${max ? `–#${max}` : ""}). Paragraphs inside data tables are unindexed and only reachable via a cell locator.`);
 	}
 	return {
 		paragraphs: [hit.element],
@@ -125,7 +124,7 @@ function resolveRange(from, to, ctx) {
 		container: fromHit.container
 	};
 }
-function resolveCell(table, row, col, ctx) {
+function resolveCell(table, row, col, paragraph, to, ctx) {
 	if (table < 1 || table > ctx.tables.length) throw new Error(`cell.table: index ${table} out of range. Document has ${ctx.tables.length} top-level table(s); valid 1..${ctx.tables.length}.`);
 	const tbl = ctx.tables[table - 1].element;
 	const rows = getChildrenNS(tbl, NS.w, "tr");
@@ -133,8 +132,17 @@ function resolveCell(table, row, col, ctx) {
 	const cells = getChildrenNS(rows[row - 1], NS.w, "tc");
 	if (col < 1 || col > cells.length) throw new Error(`cell.col: index ${col} out of range. Table ${table} row ${row} has ${cells.length} cell(s); valid 1..${cells.length}.`);
 	const tc = cells[col - 1];
+	const allParagraphs = getChildrenNS(tc, NS.w, "p");
+	if (paragraph === void 0) return {
+		paragraphs: allParagraphs,
+		container: tc
+	};
+	const cellCount = allParagraphs.length;
+	if (paragraph < 1 || paragraph > cellCount) throw new Error(`cell.paragraph: index ${paragraph} out of range. Table ${table} row ${row} col ${col} has ${cellCount} paragraph(s); valid 1..${cellCount}.`);
+	const end = to ?? paragraph;
+	if (end > cellCount) throw new Error(`cell.to: index ${end} out of range. Table ${table} row ${row} col ${col} has ${cellCount} paragraph(s); valid ${paragraph}..${cellCount}.`);
 	return {
-		paragraphs: getChildrenNS(tc, NS.w, "p"),
+		paragraphs: allParagraphs.slice(paragraph - 1, end),
 		container: tc
 	};
 }
@@ -167,30 +175,45 @@ function resolveWholeBody(ctx) {
 *                         (whitespace-only text + rPr containing `<w:u/>`)
 *   - neither given     → first blank run (= `blank: 1`)
 *
+* Accepts both locator forms:
+*   - Global: `{ paragraph: N, ... }` — indexed scope (body + layout-table cells)
+*   - Cell:   `{ table: T, row: R, col: C, paragraph: K, ... }` — data-table cell
+*
 * Throws with a clear message when the paragraph isn't found, the index is
 * out of range, or the requested blank doesn't exist (lists what blanks ARE
 * present so the agent can adjust). */
 function resolveRunLocator(loc, ctx) {
-	const hit = ctx.indexed[loc.paragraph - 1];
-	if (!hit || hit.index !== loc.paragraph) {
-		const max = ctx.indexed.length;
-		throw new Error(`paragraph #${loc.paragraph} not found. Document has ${max} indexed paragraph(s).`);
+	let pEl;
+	let locusDesc;
+	if ("table" in loc) {
+		const cellResolved = resolveCell(loc.table, loc.row, loc.col, loc.paragraph, void 0, ctx);
+		if (cellResolved.paragraphs.length !== 1) throw new Error(`run locator cell-form: expected exactly 1 paragraph, got ${cellResolved.paragraphs.length}. This is an internal error.`);
+		pEl = cellResolved.paragraphs[0];
+		locusDesc = `table ${loc.table} row ${loc.row} col ${loc.col} paragraph ${loc.paragraph}`;
+	} else {
+		const hit = ctx.indexed[loc.paragraph - 1];
+		if (!hit || hit.index !== loc.paragraph) {
+			const max = ctx.indexed.length;
+			throw new Error(`paragraph #${loc.paragraph} not found. Document has ${max} indexed paragraph(s).`);
+		}
+		pEl = hit.element;
+		locusDesc = `paragraph #${loc.paragraph}`;
 	}
-	const runs = getChildrenNS(hit.element, NS.w, "r");
-	if (runs.length === 0) throw new Error(`paragraph #${loc.paragraph} has no runs to target.`);
+	const runs = getChildrenNS(pEl, NS.w, "r");
+	if (runs.length === 0) throw new Error(`${locusDesc} has no runs to target.`);
 	if (loc.runIndex !== void 0) {
-		if (loc.runIndex < 1 || loc.runIndex > runs.length) throw new Error(`paragraph #${loc.paragraph}: runIndex ${loc.runIndex} out of range (paragraph has ${runs.length} run(s); valid 1..${runs.length}).`);
+		if (loc.runIndex < 1 || loc.runIndex > runs.length) throw new Error(`${locusDesc}: runIndex ${loc.runIndex} out of range (paragraph has ${runs.length} run(s); valid 1..${runs.length}).`);
 		return {
-			paragraph: hit.element,
+			paragraph: pEl,
 			run: runs[loc.runIndex - 1]
 		};
 	}
 	const blankK = loc.blank ?? 1;
 	const blanks = runs.filter(isBlankRun);
-	if (blanks.length === 0) throw new Error(`paragraph #${loc.paragraph}: no blank runs found. A blank run is one whose text is whitespace-only and rPr carries <w:u/> (typical form-fill placeholder). Use \`runIndex\` to target a specific run by 1-based index instead.`);
-	if (blankK < 1 || blankK > blanks.length) throw new Error(`paragraph #${loc.paragraph}: blank ${blankK} out of range (paragraph has ${blanks.length} blank run(s); valid 1..${blanks.length}).`);
+	if (blanks.length === 0) throw new Error(`${locusDesc}: no blank runs found. A blank run is one whose text is whitespace-only and rPr carries <w:u/> (typical form-fill placeholder). Use \`runIndex\` to target a specific run by 1-based index instead.`);
+	if (blankK < 1 || blankK > blanks.length) throw new Error(`${locusDesc}: blank ${blankK} out of range (paragraph has ${blanks.length} blank run(s); valid 1..${blanks.length}).`);
 	return {
-		paragraph: hit.element,
+		paragraph: pEl,
 		run: blanks[blankK - 1]
 	};
 }

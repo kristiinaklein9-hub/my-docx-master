@@ -78,10 +78,15 @@ function pickDominantStyle(styleCounts, total) {
 	if (bestCount / total < .8) return void 0;
 	return bestId;
 }
+/** Compute the raw fingerprint string for a paragraph's resolved rPr + pPr.
+* Exported so tools that walk paragraphs outside the DocumentParser scope
+* (e.g. data-table cells) can match against existing fingerprints without
+* re-parsing the full document. */
+function computeRawFingerprint(rPr, pPr) {
+	return `${rPr.fontAscii || rPr.fontHAnsi || rPr.fontEastAsia || "?"}|${rPr.size !== void 0 ? String(rPr.size) : "?"}|${(rPr.bold ? "B" : "") + (rPr.italic ? "I" : "") + (rPr.underline ? "U" : "") + (rPr.caps ? "C" : "")}|${rPr.color && rPr.color !== "auto" ? rPr.color : ""}|${pPr.alignment || ""}|${pPr.firstLineIndent || pPr.firstLineIndentChars ? "1stInd" : ""}|${pPr.numId ? "L" : ""}`;
+}
 function makeHash(p) {
-	const r = p.rPr;
-	const pp = p.pPr;
-	return `${r.fontAscii || r.fontHAnsi || r.fontEastAsia || "?"}|${r.size !== void 0 ? String(r.size) : "?"}|${(r.bold ? "B" : "") + (r.italic ? "I" : "") + (r.underline ? "U" : "") + (r.caps ? "C" : "")}|${r.color && r.color !== "auto" ? r.color : ""}|${pp.alignment || ""}|${pp.firstLineIndent || pp.firstLineIndentChars ? "1stInd" : ""}|${pp.numId ? "L" : ""}`;
+	return computeRawFingerprint(p.rPr, p.pPr);
 }
 function describe(p) {
 	const r = p.rPr;
@@ -124,4 +129,4 @@ function letterLabel(i) {
 }
 
 //#endregion
-export { Fingerprinter as t };
+export { computeRawFingerprint as n, Fingerprinter as t };

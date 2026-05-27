@@ -10,8 +10,8 @@ import { c as walkTopLevelTables, r as paragraphText, s as walkIndexedParagraphs
 *   table T row R col C  → text snippet (first 40 chars)
 *
 * Used before composing a `cell` locator. Lists every top-level table —
-* data, form, layout — because cell locators can address any of them
-* (paragraph indices skip data/form, but cell locators don't).
+* data, layout — because cell locators can address any of them
+* (paragraph indices skip data tables, but cell locators don't).
 */
 async function main() {
 	const file = process.argv[2];
@@ -40,10 +40,20 @@ async function main() {
 			for (let r = 0; r < rows.length; r++) {
 				const cells = getChildrenNS(rows[r], NS.w, "tc");
 				for (let c = 0; c < cells.length; c++) {
-					const text = cellText(cells[c]);
-					const snippet = text.length > 40 ? text.slice(0, 40) + "…" : text;
+					const paras = getChildrenNS(cells[c], NS.w, "p");
 					const paraSpan = formatParaSpan(cells[c], indexByElement);
-					out.push(`  [${r + 1},${c + 1}] ${JSON.stringify(snippet)}${paraSpan}`);
+					if (paras.length <= 1) {
+						const text = paras[0] ? paragraphText(paras[0]).trim() : "";
+						const snippet = text.length > 40 ? text.slice(0, 40) + "…" : text;
+						out.push(`  [${r + 1},${c + 1}] ${JSON.stringify(snippet)}${paraSpan}`);
+					} else {
+						out.push(`  [${r + 1},${c + 1}] paras:${paras.length}${paraSpan}`);
+						for (let k = 0; k < paras.length; k++) {
+							const pText = paragraphText(paras[k]).trim();
+							const snippet = pText.length > 40 ? pText.slice(0, 40) + "…" : pText;
+							out.push(`         K${k + 1}: ${JSON.stringify(snippet)}`);
+						}
+					}
 				}
 			}
 			out.push("");
@@ -54,17 +64,8 @@ async function main() {
 		process.exit(1);
 	}
 }
-function cellText(tc) {
-	let out = "";
-	for (const p of getChildrenNS(tc, NS.w, "p")) {
-		if (out) out += " ⏎ ";
-		const pText = paragraphText(p);
-		out += pText;
-	}
-	return out;
-}
 /** "  paras: 58–89" / "  paras: 60" / "" (empty when cell paragraphs are
-* unindexed, i.e. inside a data/form table — cell locator addresses them
+* unindexed, i.e. inside a data table — cell locator addresses them
 * by [r,c] anyway). Layout-table paragraphs each have a #NNN; surfacing
 * the span lets agents pick a non-cross-cell range locator. */
 function formatParaSpan(tc, indexByElement) {

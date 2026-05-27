@@ -19,11 +19,11 @@ Otherwise, treat a document as two kinds of paragraphs:
   - **Don't replace, don't duplicate.** A chrome paragraph stays as itself — never the target of `replace`, never quoted into an inserted paragraph's `text`. Content insertion lands in the empty placeholder slot beside the chrome (`set-run` on inline blanks; `replace` against the empty slot for separate-paragraph forms).
 - **Empty slots** — blank paragraphs pre-allocated for content insertion. Bind inserted content to a semantic style (`BodyText` / `ListNumber` / `Heading1..N`), installing the style in `styles[]` if no existing one fits. `Normal` is fallback, not a body style.
 
-**For `styles[]`**: one style per semantic role. **If the role has any paragraph already playing it in the source, the entry MUST use `fromParagraph: N`** — the engine extracts typography from that paragraph automatically; add only `outlineLevel` / `basedOn` and user-spec overrides via `overrides: { ... }`. **Top-level `size` / `bold` / `alignment` / `spaceBefore` / `lineSpacing` on a represented-role entry silently overrides the template** — the dominant over-declaration failure. Reserve top-level explicit fields for empty-slot roles or fresh styles the user explicitly speced. Full design phase: [standardize.md §1](references/standardize.md).
+**For `styles[]`**: one style per semantic role. If the role has any paragraph already playing it in the source, the entry MUST use `fromParagraph: N` — do not redeclare top-level typography fields on represented roles (silent template override). Full rule and rationale: [standardize.md §1](references/standardize.md).
 
 Tools surface visible facts; classification and judgment are yours.
 
-**Standardize-shape blocks install the canonical anchors every other op binds to** — `edits[]` `styleId` + MDF, `pattern_rules` fingerprints, `InlineRef` / STYLEREF resolution. Every paragraph the agent writes is canonical: typed structural signals (heading / list / caption prefixes, in-prose counters) never appear as literal text in the emit; install the matching anchor (`numbering` / `captions` / bookmark) and let it render the signal. Source chrome the task doesn't restructure stays as-is. User-supplied content that arrives with typed prefixes is input shape, not a directive to preserve them — strip and re-emit through the anchor unless the user explicitly requested literal typed form.
+**Standardize-shape blocks install the canonical anchors every other op binds to** — `edits[]` `styleId` + MDF, `pattern_rules` fingerprints, `InlineRef` / STYLEREF resolution. Every paragraph the agent writes is canonical: typed structural signals (heading / list / caption prefixes, in-prose counters) never appear as literal text in the emit; install the matching anchor (`numbering` / `captions` / bookmark) and let it render the signal. Source chrome the task doesn't restructure stays as-is. User-supplied content that arrives with typed prefixes is input shape, not a directive to preserve them — strip the prefix and emit each typed-prefix line as a **separate** paragraph bound to a heading / list / caption style, unless the user explicitly requested literal typed form.
 
 ## Target state
 
@@ -111,9 +111,9 @@ All tools invoked via `node <script> <args>`, output to stdout.
 
 ## Cross-command invariants
 
-- Original file is never modified; every applying CLI writes a fresh copy + validates before keeping. Validation failure → discard, surface to user — don't silently retry.
+- Original file is never modified; every applying CLI writes a fresh copy + validates before keeping. Validation uses baseline-diff — only errors *introduced* by the run are fatal. See [`standardize.md §Validation behavior`](references/standardize.md#validation-behavior); `--allow-validation-warnings` override is documented in [`config-schema.md`](references/config-schema.md).
 - Section properties sparse-by-design: untouched unless declared via `pageSetup`. Details: [`config-schema.md`](references/config-schema.md#page-setup).
-- Paragraph indexing is 1-based, matching `#NNN` in skeleton. Layout-table paragraphs are indexed; data / form-table paragraphs aren't (reachable via cell locator on edit path).
+- Paragraph indexing is 1-based, matching `#NNN` in skeleton. Layout-table paragraphs are indexed; data-table cell paragraphs aren't. Both are reachable by surgical edits — layout cells via global `#NNN` index, data cells via `cell` locator with optional `paragraph: K` / `to: M`. `RunLocator` accepts cell coords too for `set-run`. See [`references/edit.md` locator table](references/edit.md#locators-at).
 - All `edits[]` locators resolve against the **pre-edits** document state — `#NNN` from `overview` is what locators reference, regardless of intervening ops. Resolved Element refs survive subsequent mutations.
 - Paths resolve against CWD; use absolute paths if you may have changed directories.
 - Restyle: run-level direct formatting uniform across all runs gets stripped; per-run differences preserved as intentional inline emphasis.
@@ -122,3 +122,10 @@ All tools invoked via `node <script> <args>`, output to stdout.
 - Style-name preflight: before any mutation, the engine catches `<w:name>` collisions (including en/zh-CN locale aliases) and aborts with a fix hint; `--dry-run` lists collisions as warnings instead.
 
 Block-level config details: [`references/standardize.md`](references/standardize.md), [`references/edit.md`](references/edit.md), [`references/config-schema.md`](references/config-schema.md).
+
+## Where things live
+
+- **Field semantics** (any apply config field — values, constraints, defaults) → [`references/config-schema.md`](references/config-schema.md)
+- **Locator + op contracts** (addressing, edit ops, block types) → [`references/edit.md`](references/edit.md)
+- **Workflow** (audit → standardize → edit pipeline, design decisions) → respective workflow refs (`audit.md`, `standardize.md`, `edit.md`)
+- **Domain knowledge** (Chinese counting patterns, caption pipeline, classifier reasons, table layouts) → concept refs (`numbering-formats.md`, `captions.md`, `tables.md`, `equations.md`, `cross-references.md`, `header-footer.md`, `chinese-font-sizes.md`)

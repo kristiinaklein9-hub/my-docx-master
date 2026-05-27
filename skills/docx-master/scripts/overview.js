@@ -313,16 +313,16 @@ function renderElement(el, indent, range) {
 		const p = el.paragraph;
 		lines.push(`${indent}  #${pad(p.index)} [${p.fingerprint}]  "${truncate(p.text, 40)}"`);
 	} else if (el.kind === "table") if (el.classification === "layout") {
-		lines.push(`${indent}--- LAYOUT TABLE ---`);
+		lines.push(`${indent}--- LAYOUT TABLE  reason:${el.classificationReason} ---`);
 		for (const p of el.paragraphs) {
 			if (range && (p.index < range.from || p.index > range.to)) continue;
 			lines.push(`${indent}    #${pad(p.index)} [${p.fingerprint}]  "${truncate(p.text, 40)}"`);
 		}
 		lines.push(`${indent}--- END LAYOUT TABLE ---`);
-	} else if (el.classification === "data") {
-		const headers = el.headers.map((h) => `"${truncate(h, 12)}"`).slice(0, el.cols).join(",");
-		lines.push(`${indent}--- TABLE (${el.rows}×${el.cols}) headers:[${headers}] ---`);
-	} else lines.push(`${indent}--- FORM TABLE (${el.rows}×${el.cols}) ---`);
+	} else if (el.row1Texts.some((t) => t.length > 0)) {
+		const formatted = el.row1Texts.map((t) => `"${truncate(t, 12)}"`).slice(0, el.cols).join(",");
+		lines.push(`${indent}--- TABLE (${el.rows}×${el.cols}) row1:[${formatted}]  reason:${el.classificationReason} ---`);
+	} else lines.push(`${indent}--- TABLE (${el.rows}×${el.cols})  reason:${el.classificationReason} ---`);
 	else if (el.kind === "image") lines.push(`${indent}--- IMAGE (${el.widthCm.toFixed(1)}cm × ${el.heightCm.toFixed(1)}cm) ---`);
 	else if (el.kind === "equation") lines.push(`${indent}--- EQUATION ---`);
 	else if (el.kind === "pageBreak") lines.push(`${indent}--- PAGEBREAK ---`);
