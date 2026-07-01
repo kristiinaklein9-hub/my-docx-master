@@ -1,0 +1,103 @@
+{
+  "source": "/tmp/claude-0/-home-user-my-docx-master/567faf0b-55d6-5bfd-ac71-8bbcb6e82c7f/scratchpad/input.docx",
+  "output": "/tmp/claude-0/-home-user-my-docx-master/567faf0b-55d6-5bfd-ac71-8bbcb6e82c7f/scratchpad/output.docx",
+  "requirements": {
+    "2": "正文：宋体，小四号(12pt)，1.5倍行距，首行缩进2字符，两端对齐",
+    "Heading1": "一级标题（一、二、…十、）：黑体，小三号(15pt)，顶左对齐",
+    "Heading2": "二级标题（1. / 4.1 …）：黑体，小四号(12pt)",
+    "Heading3": "三级标题（1）2）…）：宋体，小四号(12pt)，加粗",
+    "Reference": "参考文献[N]：宋体/Times New Roman，小四号(12pt)，1.5倍行距，悬挂缩进2字符"
+  },
+  "styles": [
+    {
+      "id": "2",
+      "name": "Body Text",
+      "basedOn": "Normal",
+      "fontCJK": "宋体",
+      "fontLatin": "Times New Roman",
+      "size": 12,
+      "lineSpacing": 1.5,
+      "firstLineIndent": "2char",
+      "alignment": "both",
+      "spaceBefore": 0,
+      "spaceAfter": 0
+    },
+    {
+      "id": "Heading1",
+      "name": "heading 1",
+      "basedOn": "Normal",
+      "fontCJK": "黑体",
+      "fontLatin": "Times New Roman",
+      "size": 15,
+      "bold": false,
+      "lineSpacing": 1.5,
+      "alignment": "left",
+      "firstLineIndent": 0,
+      "spaceBefore": 12,
+      "spaceAfter": 6,
+      "outlineLevel": 0
+    },
+    {
+      "id": "Heading2",
+      "name": "heading 2",
+      "basedOn": "Normal",
+      "fontCJK": "黑体",
+      "fontLatin": "Times New Roman",
+      "size": 12,
+      "bold": false,
+      "lineSpacing": 1.5,
+      "alignment": "left",
+      "firstLineIndent": 0,
+      "spaceBefore": 6,
+      "spaceAfter": 3,
+      "outlineLevel": 1
+    },
+    {
+      "id": "Heading3",
+      "name": "heading 3",
+      "basedOn": "Normal",
+      "fontCJK": "宋体",
+      "fontLatin": "Times New Roman",
+      "size": 12,
+      "bold": true,
+      "lineSpacing": 1.5,
+      "alignment": "left",
+      "firstLineIndent": 0,
+      "spaceBefore": 6,
+      "spaceAfter": 3,
+      "outlineLevel": 2
+    },
+    {
+      "id": "Reference",
+      "name": "Reference",
+      "basedOn": "Normal",
+      "fontCJK": "宋体",
+      "fontLatin": "Times New Roman",
+      "size": 12,
+      "lineSpacing": 1.5,
+      "alignment": "left",
+      "firstLineIndent": 0,
+      "spaceBefore": 0,
+      "spaceAfter": 0
+    }
+  ],
+  "exclude": [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 240],
+  "assignments": [
+    { "para": 40, "action": "restyle", "style": "Heading2" },
+    { "para": 51, "action": "restyle", "style": "Heading3" }
+  ],
+  "pattern_rules": [
+    { "regex": "^[一二三四五六七八九十]+、", "style": "Heading1" },
+    { "regex": "^\\d+\\.\\d+", "style": "Heading2" },
+    { "regex": "^\\d+\\.[^0-9]", "style": "Heading2" },
+    { "regex": "^\\d+[）)]", "style": "Heading3" },
+    { "regex": "^\\[\\d+\\]", "style": "Reference" }
+  ],
+  "bulk_rules": [
+    { "fingerprint": "7a6407", "style": "2" },
+    { "fingerprint": "b8b67b", "style": "2" },
+    { "fingerprint": "0f48d5", "style": "2" },
+    { "fingerprint": "7a57cb", "style": "2" },
+    { "fingerprint": "630e88", "style": "2" }
+  ]
+}
